@@ -43,8 +43,9 @@ build/
 .DS_Store
 Thumbs.db
 
-# Local secrets & keys
+# Local secrets & keys (not the ai_platform/secrets package)
 *.pem
 *.key
 credentials.json
-secrets/
+/.secrets/
+/secrets/
