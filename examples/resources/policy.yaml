@@ -1,0 +1,16 @@
+apiVersion: platform.ai/v1
+kind: Policy
+metadata:
+  name: rbac-support-team
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  rules:
+    - effect: allow
+      principals: [team:support, anonymous]
+      actions: [agent:run, resource:publish]
+      resources: [agents/*, prompts/*, workflows/*]
+    - effect: deny
+      principals: ["*"]
+      actions: [resource:publish]
+      resources: [agents/admin-*]

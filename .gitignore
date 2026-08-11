@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Virtualenvs & local runtime
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.platform/
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / frontend
+node_modules/
+console/dist/
+console/.vite/
+npm-debug.log*
+yarn-error.log*
+
+# Build / packaging
+dist/
+build/
+*.whl
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local secrets & keys
+*.pem
+*.key
+credentials.json
+secrets/

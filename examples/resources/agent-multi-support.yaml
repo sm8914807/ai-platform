@@ -1,0 +1,24 @@
+apiVersion: platform.ai/v1
+kind: Agent
+metadata:
+  name: multi-support-agent
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  role: executor
+  modelRef: models/gpt-4o-routed
+  promptRef: prompts/support-v3
+  memoryRef: memory/session-redis
+  knowledgeRefs:
+    - knowledge/kb-product-docs
+  guardrails:
+    - guardrails/pii-mask
+  collaboration:
+    pattern: planner_executor_reviewer
+    maxIterations: 2
+    sharedContext: true
+    contextScope: session
+    agents:
+      planner: agents/planner-agent
+      executor: agents/executor-agent
+      reviewer: agents/reviewer-agent

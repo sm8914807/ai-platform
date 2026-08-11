@@ -1,0 +1,10 @@
+apiVersion: platform.ai/v1
+kind: Toolbox
+metadata:
+  name: crm-tools
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  tools:
+    - ref: tools/get-customer
+      permissions: [read:customer]

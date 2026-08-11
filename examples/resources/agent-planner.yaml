@@ -1,0 +1,10 @@
+apiVersion: platform.ai/v1
+kind: Agent
+metadata:
+  name: planner-agent
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  role: planner
+  modelRef: models/gpt-4o-routed
+  promptRef: prompts/support-v3

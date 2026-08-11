@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform
+      POSTGRES_DB: ai_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform -d ai_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      PLATFORM_DB_PATH: /data/registry.db
+      # Uncomment for Postgres-backed registry (multi-tenant SaaS):
+      # PLATFORM_DATABASE_URL: postgresql://platform:platform@postgres:5432/ai_platform
+      PLATFORM_DEFAULT_NAMESPACE: default-org/default-project
+      PLATFORM_FEDERATION_DOMAIN: local.ai-platform
+      PLATFORM_EMBEDDING_PROVIDER: ${PLATFORM_EMBEDDING_PROVIDER:-auto}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      BEDROCK_API_KEY: ${BEDROCK_API_KEY:-}
+    volumes:
+      - platform-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  api-postgres:
+    profiles: ["postgres"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8081:8080"
+    environment:
+      PLATFORM_DB_PATH: /data/aux.db
+      PLATFORM_DATABASE_URL: postgresql://platform:platform@postgres:5432/ai_platform
+      PLATFORM_DEFAULT_NAMESPACE: default-org/default-project
+      PLATFORM_FEDERATION_DOMAIN: saas.ai-platform
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - platform-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  console:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ../../console:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE: http://localhost:8080
+    depends_on:
+      - api
+
+volumes:
+  platform-data:
+  pg-data:

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/toolbox.json",
+  "title": "Toolbox",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "Toolbox" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ref"],
+            "properties": {
+              "ref": { "type": "string" },
+              "permissions": { "type": "array", "items": { "type": "string" } },
+              "rateLimit": { "type": "string" },
+              "requireApproval": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

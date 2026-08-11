@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/policy.json",
+  "title": "Policy",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "Policy" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["rules"],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["effect", "actions", "resources"],
+            "properties": {
+              "effect": { "enum": ["allow", "deny"] },
+              "principals": { "type": "array", "items": { "type": "string" } },
+              "actions": { "type": "array", "items": { "type": "string" } },
+              "resources": { "type": "array", "items": { "type": "string" } },
+              "conditions": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

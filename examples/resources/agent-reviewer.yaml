@@ -1,0 +1,10 @@
+apiVersion: platform.ai/v1
+kind: Agent
+metadata:
+  name: reviewer-agent
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  role: reviewer
+  modelRef: models/gpt-4o-routed
+  promptRef: prompts/support-v3

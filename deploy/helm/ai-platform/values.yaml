@@ -1,0 +1,51 @@
+replicaCount: 2
+
+image:
+  repository: ai-platform
+  tag: "0.6.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  hosts:
+    - host: platform.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+
+env:
+  PLATFORM_DEFAULT_NAMESPACE: default-org/default-project
+  PLATFORM_PRIMARY_REGION: us-east-1
+
+secrets:
+  openaiApiKey: ""
+  anthropicApiKey: ""
+  bedrockApiKey: ""
+
+serviceAccount:
+  create: true
+  name: ""

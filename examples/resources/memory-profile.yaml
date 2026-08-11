@@ -1,0 +1,15 @@
+apiVersion: platform.ai/v1
+kind: MemoryProfile
+metadata:
+  name: session-redis
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  layers:
+    - type: conversation
+      backend: memory
+      ttl: 24h
+      maxTokens: 32000
+  summarization:
+    enabled: false
+  versioning: true

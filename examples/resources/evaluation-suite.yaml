@@ -1,0 +1,23 @@
+apiVersion: platform.ai/v1
+kind: EvaluationSuite
+metadata:
+  name: support-quality
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  dataset:
+    - id: case-1
+      input:
+        message: billing invoice help
+      expected:
+        contains: billing
+  evaluators:
+    - type: llm_judge
+    - type: latency
+      maxP95Ms: 5000
+    - type: keyword_match
+  triggers:
+    - onPublish: [agents/support-agent]
+  gates:
+    failIf: score < 0.5
+    minScore: 0.5

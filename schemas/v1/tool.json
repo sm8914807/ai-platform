@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/tool.json",
+  "title": "Tool",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "Tool" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["adapter", "manifest"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "enum": ["mcp", "openapi", "rest", "graphql", "grpc", "cli", "custom"]
+        },
+        "manifest": {
+          "type": "object",
+          "required": ["name", "inputSchema", "outputSchema"],
+          "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "inputSchema": { "type": "object" },
+            "outputSchema": { "type": "object" }
+          }
+        },
+        "config": { "type": "object" },
+        "authRef": { "type": "string" },
+        "rateLimit": { "type": "string" }
+      }
+    }
+  }
+}

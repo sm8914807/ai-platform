@@ -1,0 +1,20 @@
+apiVersion: platform.ai/v1
+kind: Tool
+metadata:
+  name: get-customer
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  adapter: mcp
+  manifest:
+    name: get-customer
+    description: Fetch customer by ID
+    inputSchema:
+      type: object
+      properties:
+        customerId:
+          type: string
+    outputSchema:
+      type: object
+  config:
+    server: crm-mcp

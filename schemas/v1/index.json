@@ -1,0 +1,21 @@
+{
+  "kinds": [
+    "Agent",
+    "Workflow",
+    "Prompt",
+    "Toolbox",
+    "Tool",
+    "ModelRoute",
+    "MemoryProfile",
+    "KnowledgeSource",
+    "Connector",
+    "Guardrail",
+    "Policy",
+    "EvaluationSuite",
+    "MCPBinding",
+    "ApprovalFlow",
+    "Environment",
+    "Deployment"
+  ],
+  "apiVersion": "platform.ai/v1"
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/model-route.json",
+  "title": "ModelRoute",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "ModelRoute" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["strategy", "candidates"],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["weightedFallback", "costOptimized", "latencyOptimized", "capabilityMatch"]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["provider", "model"],
+            "properties": {
+              "provider": { "type": "string" },
+              "model": { "type": "string" },
+              "weight": { "type": "integer" },
+              "fallback": { "type": "boolean" },
+              "maxLatencyMs": { "type": "integer" }
+            }
+          }
+        },
+        "constraints": { "type": "object" },
+        "caching": { "type": "object" }
+      }
+    }
+  }
+}

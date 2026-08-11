@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/knowledge-source.json",
+  "title": "KnowledgeSource",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "KnowledgeSource" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "properties": {
+        "connector": { "type": "object" },
+        "ingestion": { "type": "object" },
+        "indexing": { "type": "object" },
+        "retrieval": { "type": "object" },
+        "citations": { "type": "object" },
+        "documents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "text": { "type": "string" },
+              "metadata": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

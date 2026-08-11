@@ -1,0 +1,11 @@
+apiVersion: platform.ai/v1
+kind: Guardrail
+metadata:
+  name: pii-mask
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  type: pii_mask
+  config:
+    entities: [email, phone, credit_card]
+    action: mask

@@ -1,0 +1,11 @@
+apiVersion: platform.ai/v1
+kind: Agent
+metadata:
+  name: support-agent
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  role: executor
+  modelRef: models/gpt-4o-routed
+  promptRef: prompts/support-v3
+  toolboxRef: toolboxes/crm-tools

@@ -1,0 +1,11 @@
+apiVersion: platform.ai/v1
+kind: Environment
+metadata:
+  name: production
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  promotionFrom: staging
+  requireApproval: true
+  approvers: [team:platform-admins]
+  bundlePolicy: signed-only

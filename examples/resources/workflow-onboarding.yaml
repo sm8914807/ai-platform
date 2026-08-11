@@ -1,0 +1,25 @@
+apiVersion: platform.ai/v1
+kind: Workflow
+metadata:
+  name: onboarding-flow
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  trigger:
+    type: event
+    event: user.created
+  steps:
+    - id: enrich
+      type: agent
+      ref: agents/support-agent
+      timeout: 30s
+      retry:
+        maxAttempts: 3
+    - id: approve
+      type: humanApproval
+      ref: approval-flows/manager-signoff
+      timeout: 72h
+    - id: complete
+      type: agent
+      ref: agents/support-agent
+      when: "$.steps.approve.status == approved"

@@ -1,0 +1,24 @@
+apiVersion: platform.ai/v1
+kind: KnowledgeSource
+metadata:
+  name: kb-product-docs
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  retrieval:
+    topK: 5
+    hybrid: true
+  citations:
+    enabled: true
+  documents:
+    - id: billing-doc
+      text: |
+        Enterprise billing support handles invoices, refunds, and payment disputes.
+        Contact billing@company.com for invoice # issues.
+      metadata:
+        product: billing
+    - id: onboarding-doc
+      text: |
+        User onboarding includes account creation, welcome email, and manager approval.
+      metadata:
+        product: onboarding

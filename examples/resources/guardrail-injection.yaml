@@ -1,0 +1,10 @@
+apiVersion: platform.ai/v1
+kind: Guardrail
+metadata:
+  name: injection-detect
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  type: injection_detect
+  config:
+    action: alert

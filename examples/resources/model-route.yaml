@@ -1,0 +1,16 @@
+apiVersion: platform.ai/v1
+kind: ModelRoute
+metadata:
+  name: gpt-4o-routed
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  strategy: weightedFallback
+  candidates:
+    - provider: mock
+      model: mock-1
+      weight: 100
+      fallback: true
+  caching:
+    enabled: true
+    ttl: 3600

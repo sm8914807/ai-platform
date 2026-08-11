@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/guardrail.json",
+  "title": "Guardrail",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "Guardrail" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["pii_mask", "injection_detect", "content_moderation", "custom"] },
+        "config": { "type": "object" }
+      }
+    }
+  }
+}

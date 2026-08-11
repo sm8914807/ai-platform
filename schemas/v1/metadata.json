@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/metadata.json",
+  "title": "ResourceMetadata",
+  "type": "object",
+  "required": ["name", "namespace"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "namespace": { "type": "string" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+    "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+  }
+}

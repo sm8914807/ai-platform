@@ -1,0 +1,13 @@
+apiVersion: platform.ai/v1
+kind: Prompt
+metadata:
+  name: support-v3
+  namespace: default-org/default-project
+  version: "1.0.0"
+spec:
+  template: |
+    You are a support agent.
+    User request: {{ input }}
+  variables:
+    input:
+      type: string

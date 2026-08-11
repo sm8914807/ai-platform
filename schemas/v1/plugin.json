@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://platform.ai/schemas/v1/plugin.json",
+  "title": "Plugin",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "platform.ai/v1" },
+    "kind": { "const": "Plugin" },
+    "metadata": { "$ref": "metadata.json" },
+    "spec": {
+      "type": "object",
+      "required": ["type", "version", "resources"],
+      "properties": {
+        "type": { "enum": ["connector", "tool", "agent", "workflow", "prompt", "guardrail"] },
+        "version": { "type": "string" },
+        "author": { "type": "string" },
+        "tier": { "enum": ["community", "verified", "enterprise"] },
+        "permissions": { "type": "array", "items": { "type": "string" } },
+        "resources": { "type": "array" },
+        "pricing": { "type": "object" }
+      }
+    }
+  }
+}
