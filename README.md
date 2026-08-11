@@ -65,7 +65,7 @@ docker compose -f deploy/docker/docker-compose.yml up --build
 | **Federation (AMTP)** | Cross-domain agent messaging |
 | **Deploy** | Docker Compose + Helm |
 
-Architecture notes and phase history live under [`docs/`](docs/).
+See [Architecture](docs/architecture.md) for how the pieces connect.
 
 ---
 
@@ -110,7 +110,7 @@ schemas/v1/    # CRD JSON Schemas
 deploy/        # Docker + Helm
 examples/      # Sample resources
 scripts/       # Dev + seed helpers
-docs/          # Design & capability docs
+docs/          # Architecture overview
 tests/         # Pytest suite
 ```
 
