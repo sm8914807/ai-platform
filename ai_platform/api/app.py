@@ -209,6 +209,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await app.state.platform.dynamic_workflows.migrate()
         await app.state.platform.message_bus.migrate()
         await app.state.platform.secrets.migrate()
+        await app.state.platform.git_sync.migrate()
         yield
         await sql.close()
         if backend == "postgres" and hasattr(registry, "close"):

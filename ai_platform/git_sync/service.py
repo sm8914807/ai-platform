@@ -1,10 +1,8 @@
 """Git sync — apply/export YAML resources."""
 
 import hashlib
-import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import aiosqlite
 import yaml
@@ -13,11 +11,20 @@ from ai_platform.core.ids import new_id
 from ai_platform.core.models import GitSyncResult, PlatformResource, ResourceKind, ResourceMetadata
 from ai_platform.registry.store import RegistryStore
 
+MIGRATION = Path(__file__).parent.parent.parent / "migrations" / "003_phase3.sql"
+
 
 class GitSyncService:
     def __init__(self, registry: RegistryStore, db_path: str) -> None:
         self.registry = registry
         self.db_path = db_path
+
+    async def migrate(self) -> None:
+        conn = await aiosqlite.connect(self.db_path)
+        if MIGRATION.exists():
+            await conn.executescript(MIGRATION.read_text())
+        await conn.commit()
+        await conn.close()
 
     async def register_repo(self, namespace_id: str, repo_path: str, branch: str = "main") -> str:
         repo_id = new_id("git")

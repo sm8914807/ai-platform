@@ -110,6 +110,7 @@ async def test_git_sync_apply_export(tmp_path):
 
     db = tempfile.mktemp(suffix=".db")
     git = GitSyncService(store, db)
+    await git.migrate()
     resources_dir = tmp_path / "resources"
     resources_dir.mkdir()
     (resources_dir / "prompt.yaml").write_text(
@@ -177,4 +178,6 @@ def test_terraform_export(tmp_path):
     assert count == 1
     assert (out / "provider.tf").exists()
     json_out = export_terraform_json(published, "org/project")
-    assert "export-prompt" in json_out
+    # Terraform resource addresses use underscores, not hyphens
+    assert "export_prompt" in json_out
+    assert "platform_prompt" in json_out
