@@ -11,7 +11,6 @@ COPY pyproject.toml requirements.txt README.md ./
 COPY ai_platform ./ai_platform
 COPY schemas ./schemas
 COPY migrations ./migrations
-COPY events ./events
 
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -e .
