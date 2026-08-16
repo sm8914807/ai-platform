@@ -220,6 +220,24 @@ class PostgresRegistryStore(RegistryStore):
             resource.id,
         )
 
+    async def unpublish(
+        self, namespace_id: str, kind: ResourceKind, name: str
+    ) -> None:
+        resource = await self.get_resource(namespace_id, kind, name)
+        if not resource:
+            raise ValueError(f"Resource not found: {kind.value}/{name}")
+        await self.pool.execute(
+            "UPDATE resources SET published_version = NULL, updated_at = $1 WHERE id = $2",
+            datetime.now(timezone.utc),
+            resource.id,
+        )
+
+    async def list_namespaces(self) -> list[dict[str, Any]]:
+        rows = await self.pool.fetch(
+            "SELECT id, path, env FROM namespaces ORDER BY path, env"
+        )
+        return [{"id": r["id"], "path": r["path"], "env": r["env"]} for r in rows]
+
     async def set_bundle_hash(self, resource_version_id: str, bundle_hash: str) -> None:
         await self.pool.execute(
             "UPDATE resource_versions SET bundle_hash = $1 WHERE id = $2",

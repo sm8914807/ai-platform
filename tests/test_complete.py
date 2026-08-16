@@ -21,12 +21,51 @@ from ai_platform.federation.amtp import (
 
 @pytest.fixture
 async def client(tmp_path: Path):
-    settings = Settings(db_path=str(tmp_path / "test.db"))
+    settings = Settings(db_path=str(tmp_path / "test.db"), auth_required=False)
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac
+
+
+@pytest.fixture
+async def authed_client(tmp_path: Path):
+    settings = Settings(db_path=str(tmp_path / "auth.db"), auth_required=True)
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            login = await ac.post(
+                "/v1/auth/login",
+                json={"email": "ops@example.com", "orgId": "default-org", "displayName": "Ops"},
+            )
+            assert login.status_code == 200, login.text
+            ac.headers["Authorization"] = f"Bearer {login.json()['accessToken']}"
+            yield ac
+
+
+@pytest.mark.asyncio
+async def test_auth_required_rejects_anonymous(authed_client: AsyncClient):
+    # Drop token — middleware must reject protected routes.
+    client = authed_client
+    client.headers.pop("Authorization", None)
+    denied = await client.get("/v1/default-org/default-project/resources")
+    assert denied.status_code == 401
+
+    login = await client.post(
+        "/v1/auth/login",
+        json={"email": "ops@example.com", "orgId": "default-org"},
+    )
+    assert login.status_code == 200
+    client.headers["Authorization"] = f"Bearer {login.json()['accessToken']}"
+    ok = await client.get("/v1/default-org/default-project/resources")
+    assert ok.status_code == 200
+
+    # SCIM also requires auth when auth_required=True
+    client.headers.pop("Authorization", None)
+    scim = await client.get("/scim/v2/Users")
+    assert scim.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -130,6 +169,71 @@ async def test_api_v8_health_and_amtp(client: AsyncClient):
     )
     # May 400 on schema validation depending on Agent CRD — accept 200 or 400
     assert put.status_code in (200, 400)
+
+
+@pytest.mark.asyncio
+async def test_studio_capability_registration_and_agent_test(client: AsyncClient):
+    ns = "default-org/default-project"
+
+    registered = await client.post(
+        f"/v1/{ns}/discovery/register",
+        json={
+            "agent_ref": "agents/studio-test",
+            "address": "studio-test@platform.local",
+            "capabilities": ["support", "test"],
+            "delivery_mode": "pull",
+        },
+    )
+    assert registered.status_code == 200
+    assert registered.json()["capabilities"] == ["support", "test"]
+
+    resources = [
+        (
+            "Prompt",
+            "studio-prompt",
+            {"template": "You are a test agent. User: {{ input }}"},
+        ),
+        (
+            "ModelRoute",
+            "studio-model",
+            {
+                "strategy": "weightedFallback",
+                "candidates": [{"provider": "mock", "model": "mock-1", "weight": 100}],
+            },
+        ),
+        (
+            "Agent",
+            "studio-test",
+            {
+                "role": "executor",
+                "modelRef": "models/studio-model",
+                "promptRef": "prompts/studio-prompt",
+            },
+        ),
+    ]
+    for kind, name, spec in resources:
+        put = await client.put(
+            f"/v1/{ns}/{kind}/{name}/versions/1.0.0",
+            json={
+                "api_version": "platform.ai/v1",
+                "kind": kind,
+                "metadata": {"name": name, "namespace": ns, "version": "1.0.0"},
+                "spec": spec,
+            },
+        )
+        assert put.status_code == 200, put.text
+        publish = await client.post(
+            f"/v1/{ns}/{kind}/{name}/publish",
+            json={"version": "1.0.0", "principal": "test"},
+        )
+        assert publish.status_code == 200, publish.text
+
+    executed = await client.post(
+        f"/v1/{ns}/execute",
+        json={"resource_ref": "agents/studio-test", "input": {"message": "hello"}},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["type"] == "done"
 
 
 def test_format_address():

@@ -108,6 +108,56 @@ class WorkflowStateStore:
             return None
         return WorkflowRunState.model_validate(_as_dict(row["state_blob_json"]))
 
+    async def list_runs(
+        self,
+        *,
+        status: str | None = None,
+        namespace_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if namespace_id:
+            clauses.append("namespace_id = ?")
+            params.append(namespace_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 200)))
+        rows = await self.sql.fetchall(
+            f"SELECT id, workflow_version_id, org_id, namespace_id, status, "
+            f"input_json, output_json, started_at, completed_at, checkpoint_seq "
+            f"FROM workflow_runs {where} ORDER BY started_at DESC LIMIT ?",
+            *params,
+        )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            state = await self.load_checkpoint(row["id"])
+            items.append(
+                {
+                    "runId": row["id"],
+                    "workflowVersionId": row["workflow_version_id"],
+                    "orgId": row["org_id"],
+                    "namespaceId": row["namespace_id"],
+                    "status": row["status"],
+                    "input": _as_dict(row["input_json"]),
+                    "output": _as_dict(row["output_json"]),
+                    "startedAt": row["started_at"],
+                    "completedAt": row.get("completed_at"),
+                    "checkpointSeq": row["checkpoint_seq"],
+                    "workflowRef": state.workflow_ref if state else None,
+                    "currentStepId": state.current_step_id if state else None,
+                    "steps": state.steps if state else {},
+                    "pendingApproval": (
+                        state.pending_approval
+                        if state and state.pending_approval
+                        else None
+                    ),
+                }
+            )
+        return items
+
     async def record_step(
         self,
         run_id: str,

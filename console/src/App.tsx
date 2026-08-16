@@ -1,12 +1,26 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   api,
+  clearSession,
   DEFAULT_NS,
+  getNamespace,
+  getRecentNamespaces,
+  getToken,
+  getUser,
+  setNamespace,
+  setSession,
+  type AuthUser,
   type CompliancePack,
   type DiscoveredAgent,
+  type EdgeNode,
   type FederatedPeer,
   type Health,
+  type HitlInboxItem,
+  type MarketplacePlugin,
+  type MetricStats,
+  type NamespaceInfo,
   type PlatformMessage,
+  type RegionInfo,
   type Resource,
   type SecretMeta,
   type Trace,
@@ -19,6 +33,13 @@ import {
   PlatformArchitecture,
   workflowToNodes,
 } from "./diagrams";
+import {
+  cleanSpec,
+  defaultSpec,
+  hasVisualForm,
+  ResourceSpecForm,
+  type Spec,
+} from "./resourceForms";
 import "./styles.css";
 
 type View =
@@ -29,10 +50,19 @@ type View =
   | "traces"
   | "discovery"
   | "workflows"
+  | "collaboration"
   | "messaging"
   | "secrets"
   | "federation"
-  | "compliance";
+  | "compliance"
+  | "promotion"
+  | "marketplace"
+  | "metrics"
+  | "evaluations"
+  | "git"
+  | "terraform"
+  | "regions"
+  | "hitl";
 
 const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
   {
@@ -43,6 +73,7 @@ const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
       { id: "resources", label: "Resources" },
       { id: "editor", label: "Resource editor" },
       { id: "workflows", label: "Dynamic flows" },
+      { id: "collaboration", label: "Multi-agent" },
     ],
   },
   {
@@ -51,14 +82,22 @@ const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
       { id: "traces", label: "Context graph" },
       { id: "discovery", label: "Discovery" },
       { id: "messaging", label: "Message bus" },
+      { id: "hitl", label: "HITL inbox" },
       { id: "federation", label: "AMTP federation" },
     ],
   },
   {
     label: "Ops",
     items: [
+      { id: "metrics", label: "Metrics" },
+      { id: "evaluations", label: "Evaluations" },
+      { id: "regions", label: "Regions & edge" },
+      { id: "git", label: "Git sync" },
+      { id: "terraform", label: "Terraform" },
       { id: "secrets", label: "Secrets" },
       { id: "compliance", label: "Compliance" },
+      { id: "promotion", label: "Promotion" },
+      { id: "marketplace", label: "Marketplace" },
     ],
   },
 ];
@@ -69,15 +108,43 @@ const COMMANDS: { id: View; label: string; hint: string }[] = NAV_GROUPS.flatMap
 
 export default function App() {
   const [view, setView] = useState<View>("overview");
-  const [ns] = useState(DEFAULT_NS);
+  const [ns, setNs] = useState(() => getNamespace());
+  const [namespaces, setNamespaces] = useState<NamespaceInfo[]>([]);
+  const [nsDraft, setNsDraft] = useState(() => getNamespace());
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cmdOpen, setCmdOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<Resource | null>(null);
+  const [editorSeed, setEditorSeed] = useState<"new" | "clone" | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(() => getUser());
+  const [authed, setAuthed] = useState(() => Boolean(getToken()));
 
   useEffect(() => {
+    if (!authed) return;
     api.health().then(setHealth).catch(() => setHealth(null));
-  }, []);
+    api
+      .listNamespaces()
+      .then((r) => setNamespaces(r.namespaces))
+      .catch(() => undefined);
+  }, [authed, ns]);
+
+  function switchNamespace(path: string) {
+    const clean = path.trim();
+    if (!clean || !clean.includes("/")) {
+      setError("Namespace must be org/project");
+      return;
+    }
+    void api
+      .ensureNamespace(clean)
+      .then(() => {
+        setNamespace(clean);
+        setNs(clean);
+        setNsDraft(clean);
+        setEditTarget(null);
+        api.listNamespaces().then((r) => setNamespaces(r.namespaces)).catch(() => undefined);
+      })
+      .catch((e) => setError(String((e as Error).message ?? e)));
+  }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -91,8 +158,21 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  if (!authed) {
+    return (
+      <LoginScreen
+        onLoggedIn={(u) => {
+          setUser(u);
+          setAuthed(true);
+        }}
+        onError={setError}
+        error={error}
+      />
+    );
+  }
+
   return (
-    <div className="app-root">
+    <div className="app-root" data-testid="studio-app">
       <header className="topbar">
         <div className="topbar-brand">
           <span className="topbar-mark">AI</span>
@@ -102,9 +182,62 @@ export default function App() {
           ⌘K Command
         </button>
         <div className="topbar-ns muted">
-          <span className="badge ok">{health ? `v${health.version}` : "…"}</span>
+          <label className="ns-switcher" data-testid="ns-switcher">
+            <span className="muted">NS</span>
+            <select
+              value={ns}
+              onChange={(e) => switchNamespace(e.target.value)}
+              title="Active namespace"
+            >
+              {Array.from(
+                new Set([
+                  ns,
+                  DEFAULT_NS,
+                  ...getRecentNamespaces(),
+                  ...namespaces.map((n) => n.path),
+                ]),
+              ).map((path) => (
+                <option key={path} value={path}>
+                  {path}
+                </option>
+              ))}
+            </select>
+          </label>
+          <form
+            className="ns-add"
+            onSubmit={(e) => {
+              e.preventDefault();
+              switchNamespace(nsDraft);
+            }}
+          >
+            <input
+              value={nsDraft}
+              onChange={(e) => setNsDraft(e.target.value)}
+              placeholder="org/project"
+              aria-label="Namespace path"
+            />
+            <button type="submit" className="ghost">
+              Go
+            </button>
+          </form>
+          <span className="badge ok" data-testid="health-version">
+            {health ? `v${health.version}` : "…"}
+          </span>
           <span className="badge">{health?.sqlBackend ?? health?.registryBackend ?? "—"}</span>
-          <span className="mono">{ns}</span>
+          <span className="mono" data-testid="user-email">
+            {user?.email ?? "signed in"}
+          </span>
+          <button
+            className="ghost"
+            data-testid="sign-out"
+            onClick={() => {
+              clearSession();
+              setAuthed(false);
+              setUser(null);
+            }}
+          >
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -117,6 +250,7 @@ export default function App() {
                 <button
                   key={item.id}
                   className={view === item.id ? "nav-item active" : "nav-item"}
+                  data-testid={`nav-${item.id}`}
                   onClick={() => {
                     if (item.id !== "editor") setEditTarget(null);
                     setView(item.id);
@@ -142,7 +276,22 @@ export default function App() {
               ns={ns}
               onError={setError}
               onEdit={(r) => {
+                setEditorSeed(null);
                 setEditTarget(r);
+                setView("editor");
+              }}
+              onNew={() => {
+                setEditorSeed("new");
+                setEditTarget(null);
+                setView("editor");
+              }}
+              onClone={(r) => {
+                setEditorSeed("clone");
+                setEditTarget({
+                  ...r,
+                  name: `${r.name}-copy`,
+                  version: "1.0.0",
+                });
                 setView("editor");
               }}
             />
@@ -152,7 +301,9 @@ export default function App() {
               ns={ns}
               onError={setError}
               initial={editTarget}
+              seed={editorSeed}
               onPublished={() => {
+                setEditorSeed(null);
                 setEditTarget(null);
                 setView("resources");
               }}
@@ -160,11 +311,20 @@ export default function App() {
           )}
           {view === "traces" && <TracesView ns={ns} onError={setError} />}
           {view === "discovery" && <DiscoveryView ns={ns} onError={setError} />}
-          {view === "workflows" && <WorkflowsView ns={ns} onError={setError} />}
+          {view === "workflows" && <WorkflowsView ns={ns} onError={setError} go={setView} />}
+          {view === "collaboration" && <CollaborationView ns={ns} onError={setError} />}
           {view === "messaging" && <MessagingView ns={ns} onError={setError} />}
+          {view === "hitl" && <HitlInboxView ns={ns} onError={setError} />}
           {view === "secrets" && <SecretsView ns={ns} onError={setError} />}
           {view === "federation" && <FederationView ns={ns} onError={setError} />}
-          {view === "compliance" && <ComplianceView onError={setError} />}
+          {view === "compliance" && <ComplianceView ns={ns} user={user} onError={setError} />}
+          {view === "promotion" && <PromotionView ns={ns} user={user} onError={setError} />}
+          {view === "marketplace" && <MarketplaceView ns={ns} onError={setError} />}
+          {view === "metrics" && <MetricsView ns={ns} onError={setError} />}
+          {view === "evaluations" && <EvaluationsView ns={ns} onError={setError} />}
+          {view === "regions" && <RegionsView ns={ns} onError={setError} />}
+          {view === "git" && <GitSyncView ns={ns} user={user} onError={setError} />}
+          {view === "terraform" && <TerraformView ns={ns} onError={setError} />}
         </main>
       </div>
 
@@ -177,6 +337,208 @@ export default function App() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+function b64url(bytes: ArrayBuffer | Uint8Array): string {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let s = "";
+  arr.forEach((b) => {
+    s += String.fromCharCode(b);
+  });
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function createPkce(): Promise<{ verifier: string; challenge: string }> {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const verifier = b64url(raw);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64url(digest) };
+}
+
+function LoginScreen({
+  onLoggedIn,
+  onError,
+  error,
+}: {
+  onLoggedIn: (u: AuthUser) => void;
+  onError: (e: string) => void;
+  error: string | null;
+}) {
+  const [email, setEmail] = useState("ops@example.com");
+  const [orgId, setOrgId] = useState("default-org");
+  const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<"dev" | "oidc">("dev");
+  const [devLoginEnabled, setDevLoginEnabled] = useState(true);
+  const [idpLabel, setIdpLabel] = useState("OIDC");
+
+  useEffect(() => {
+    api
+      .authConfig()
+      .then((cfg) => {
+        setMode(cfg.mode);
+        setDevLoginEnabled(cfg.devLoginEnabled);
+        setOrgId(cfg.defaultOrgId || "default-org");
+        if (cfg.oidc?.issuer) {
+          if (cfg.oidc.issuer.includes("okta.com")) setIdpLabel("Okta");
+          else if (cfg.oidc.issuer.includes("microsoftonline.com") || cfg.oidc.issuer.includes("windows.net"))
+            setIdpLabel("Microsoft");
+          else if (cfg.oidc.issuer.includes("auth0.com")) setIdpLabel("Auth0");
+          else setIdpLabel("OIDC IdP");
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    if (!code || !state) return;
+
+    const pendingRaw = sessionStorage.getItem("platform.oidc.pending");
+    if (!pendingRaw) {
+      onError("OIDC callback missing PKCE session — start sign-in again");
+      return;
+    }
+    let pending: { verifier: string; state: string; orgId: string };
+    try {
+      pending = JSON.parse(pendingRaw) as { verifier: string; state: string; orgId: string };
+    } catch {
+      onError("OIDC session corrupt — start sign-in again");
+      return;
+    }
+    if (pending.state !== state) {
+      onError("OIDC state mismatch — start sign-in again");
+      return;
+    }
+
+    setBusy(true);
+    void api
+      .oidcCallback({
+        code,
+        state,
+        codeVerifier: pending.verifier,
+        orgId: pending.orgId,
+      })
+      .then((res) => {
+        sessionStorage.removeItem("platform.oidc.pending");
+        window.history.replaceState({}, "", window.location.pathname);
+        setSession(res.accessToken, res.user);
+        onLoggedIn(res.user);
+      })
+      .catch((err) => onError(String((err as Error).message ?? err)))
+      .finally(() => setBusy(false));
+  }, [onError, onLoggedIn]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const res = await api.login(email, orgId, email.split("@")[0]);
+      setSession(res.accessToken, res.user);
+      onLoggedIn(res.user);
+    } catch (err) {
+      onError(String((err as Error).message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startOidc() {
+    setBusy(true);
+    try {
+      const pkce = await createPkce();
+      const redirectUri = `${window.location.origin}/`;
+      const started = await api.oidcStart({
+        codeChallenge: pkce.challenge,
+        orgId,
+        redirectUri,
+      });
+      sessionStorage.setItem(
+        "platform.oidc.pending",
+        JSON.stringify({ verifier: pkce.verifier, state: started.state, orgId }),
+      );
+      window.location.assign(started.authorizationUrl);
+    } catch (err) {
+      onError(String((err as Error).message ?? err));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="login-screen" data-testid="login-screen">
+      <form className="login-card" onSubmit={submit} data-testid="login-form">
+        <div className="topbar-brand" style={{ marginBottom: "1rem" }}>
+          <span className="topbar-mark">AI</span>
+          <span>Platform Studio</span>
+        </div>
+        <h1>Sign in</h1>
+        <p className="muted">
+          {mode === "oidc"
+            ? `Enterprise OIDC via ${idpLabel}. Platform issues a session JWT after IdP login.`
+            : "Dev JWT login for the control plane. Creates the user on first sign-in."}
+        </p>
+        {error && <div className="banner error">{error}</div>}
+
+        {mode === "oidc" && (
+          <button
+            type="button"
+            className="primary"
+            style={{ width: "100%", marginBottom: "0.85rem" }}
+            disabled={busy}
+            data-testid="oidc-login"
+            onClick={() => void startOidc()}
+          >
+            {busy ? "Redirecting…" : `Sign in with ${idpLabel}`}
+          </button>
+        )}
+
+        {devLoginEnabled && (
+          <>
+            {mode === "oidc" && (
+              <p className="muted form-hint" style={{ marginBottom: "0.75rem" }}>
+                Dev email login is still enabled (set <span className="mono">PLATFORM_ALLOW_DEV_LOGIN=false</span>{" "}
+                in production).
+              </p>
+            )}
+            <label className="form-field">
+              <span className="form-label">Email</span>
+              <input
+                data-testid="login-email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+              />
+            </label>
+            <label className="form-field">
+              <span className="form-label">Org id</span>
+              <input
+                data-testid="login-org"
+                value={orgId}
+                onChange={(e) => setOrgId(e.target.value)}
+                required
+              />
+            </label>
+            <button className="primary" disabled={busy} type="submit" data-testid="login-submit">
+              {busy ? "Signing in…" : mode === "oidc" ? "Dev sign in" : "Sign in"}
+            </button>
+          </>
+        )}
+
+        {!devLoginEnabled && mode === "oidc" && (
+          <label className="form-field">
+            <span className="form-label">Org id (claim mapping)</span>
+            <input
+              data-testid="login-org"
+              value={orgId}
+              onChange={(e) => setOrgId(e.target.value)}
+              required
+            />
+          </label>
+        )}
+      </form>
     </div>
   );
 }
@@ -449,22 +811,34 @@ function ResourcesView({
   ns,
   onError,
   onEdit,
+  onNew,
+  onClone,
 }: {
   ns: string;
   onError: (e: string) => void;
   onEdit?: (r: Resource) => void;
+  onNew?: () => void;
+  onClone?: (r: Resource) => void;
 }) {
   const [resources, setResources] = useState<Resource[]>([]);
   const [selected, setSelected] = useState<Resource | null>(null);
   const [filter, setFilter] = useState("");
   const [tab, setTab] = useState<"spec" | "raw">("spec");
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(() => {
     api
       .listResources(ns)
       .then((r) => {
         setResources(r.resources);
-        setSelected((cur) => cur ?? (r.resources[0] ?? null));
+        setSelected((cur) => {
+          if (!cur) return r.resources[0] ?? null;
+          return (
+            r.resources.find((x) => x.kind === cur.kind && x.name === cur.name) ??
+            r.resources[0] ??
+            null
+          );
+        });
       })
       .catch((e) => onError(String(e.message ?? e)));
   }, [ns, onError]);
@@ -479,17 +853,37 @@ function ResourcesView({
     return `${r.kind}/${r.name}`.toLowerCase().includes(q);
   });
 
+  async function unpublishSelected() {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await api.unpublishResource(ns, selected.kind, selected.name);
+      load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section>
       <header className="page-header row">
         <div>
           <h1>Resources</h1>
           <p className="muted">
-            Published CRDs in this namespace ({resources.length} total). Open one to inspect —
-            edit via Resource editor.
+            Published CRDs in <span className="mono">{ns}</span> ({resources.length} total). Create,
+            clone, edit, or unpublish.
           </p>
         </div>
-        <button onClick={load}>Refresh</button>
+        <div className="form-row" style={{ marginBottom: 0 }}>
+          {onNew && (
+            <button className="primary" onClick={onNew}>
+              New resource
+            </button>
+          )}
+          <button onClick={load}>Refresh</button>
+        </div>
       </header>
       <div className="form-row">
         <input
@@ -502,9 +896,8 @@ function ResourcesView({
         <div className="panel list">
           {filtered.length === 0 && (
             <p className="muted" style={{ padding: "0.75rem" }}>
-              No published resources. Run{" "}
-              <span className="mono">scripts/seed_offline.py</span> or use Resource editor → Save
-              & publish.
+              No published resources. Use <strong>New resource</strong>, Git sync, or{" "}
+              <span className="mono">scripts/seed_offline.py</span>.
             </p>
           )}
           {filtered.map((r) => (
@@ -542,6 +935,12 @@ function ResourcesView({
                     Edit
                   </button>
                 )}
+                {onClone && (
+                  <button onClick={() => onClone(selected)}>Clone</button>
+                )}
+                <button disabled={busy} onClick={unpublishSelected}>
+                  {busy ? "…" : "Unpublish"}
+                </button>
               </div>
               {tab === "spec" ? (
                 <dl className="inspector-meta">
@@ -590,42 +989,63 @@ function EditorView({
   onError,
   onPublished,
   initial,
+  seed,
 }: {
   ns: string;
   onError: (e: string) => void;
   onPublished?: () => void;
   initial?: Resource | null;
+  seed?: "new" | "clone" | null;
 }) {
   const [kind, setKind] = useState(initial?.kind ?? "Agent");
   const [name, setName] = useState(initial?.name ?? "support-agent");
   const [version, setVersion] = useState(initial?.version ?? "1.0.0");
-  const [specText, setSpecText] = useState(
-    JSON.stringify(
-      initial?.spec ?? {
-        role: "executor",
-        modelRef: "models/gpt-4o-routed",
-        promptRef: "prompts/support-v3",
-        toolboxRef: "toolboxes/crm-tools",
-      },
-      null,
-      2,
-    ),
+  const [spec, setSpec] = useState<Spec>(
+    () => (initial?.spec as Spec) ?? defaultSpec(initial?.kind ?? "Agent"),
+  );
+  const [editMode, setEditMode] = useState<"form" | "json">("form");
+  const [specText, setSpecText] = useState(() =>
+    JSON.stringify(initial?.spec ?? defaultSpec(initial?.kind ?? "Agent"), null, 2),
   );
   const [existing, setExisting] = useState<Resource[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [testInput, setTestInput] = useState('{"message":"Hello from Platform Studio"}');
+  const [testResult, setTestResult] = useState<Record<string, unknown> | null>(null);
+  const [testBusy, setTestBusy] = useState(false);
+  const [evalSuiteRef, setEvalSuiteRef] = useState("");
+  const [evalResult, setEvalResult] = useState<Record<string, unknown> | null>(null);
+  const [evalBusy, setEvalBusy] = useState(false);
+  const [evalTarget, setEvalTarget] = useState("agents/support-agent");
 
   useEffect(() => {
     api.listResources(ns).then((r) => setExisting(r.resources)).catch(() => undefined);
   }, [ns]);
 
   useEffect(() => {
+    if (seed === "new") {
+      const nextKind = "Agent";
+      const nextSpec = defaultSpec(nextKind);
+      setKind(nextKind);
+      setName("new-agent");
+      setVersion("1.0.0");
+      setSpec(nextSpec);
+      setSpecText(JSON.stringify(nextSpec, null, 2));
+      setEditMode("form");
+      setStatus("New draft — set kind/name, then Save & publish");
+      return;
+    }
     if (!initial) return;
     setKind(initial.kind);
     setName(initial.name);
     setVersion(initial.version);
+    setSpec(initial.spec as Spec);
     setSpecText(JSON.stringify(initial.spec, null, 2));
-  }, [initial]);
+    setEditMode(hasVisualForm(initial.kind) ? "form" : "json");
+    if (seed === "clone") {
+      setStatus(`Cloned as ${initial.kind}/${initial.name} — Save & publish to create`);
+    }
+  }, [initial, seed]);
 
   function loadExisting(key: string) {
     const r = existing.find((x) => `${x.kind}/${x.name}` === key);
@@ -633,22 +1053,60 @@ function EditorView({
     setKind(r.kind);
     setName(r.name);
     setVersion(r.version);
+    setSpec(r.spec as Spec);
     setSpecText(JSON.stringify(r.spec, null, 2));
+    setEditMode(hasVisualForm(r.kind) ? "form" : "json");
     setStatus(`Loaded ${r.kind}/${r.name}`);
+  }
+
+  function onKindChange(next: string) {
+    setKind(next);
+    const nextSpec = defaultSpec(next);
+    setSpec(nextSpec);
+    setSpecText(JSON.stringify(nextSpec, null, 2));
+    setEditMode(hasVisualForm(next) ? "form" : "json");
+  }
+
+  function switchToJson() {
+    setSpecText(JSON.stringify(cleanSpec(spec), null, 2));
+    setEditMode("json");
+  }
+
+  function switchToForm() {
+    if (!hasVisualForm(kind)) return;
+    try {
+      setSpec(JSON.parse(specText) as Spec);
+    } catch {
+      onError("Fix JSON syntax before switching to Form");
+      return;
+    }
+    setEditMode("form");
+  }
+
+  function onFormSpecChange(next: Spec) {
+    setSpec(next);
+    setSpecText(JSON.stringify(cleanSpec(next), null, 2));
   }
 
   async function save(publish: boolean) {
     setBusy(true);
     setStatus(null);
     try {
-      const spec = JSON.parse(specText) as Record<string, unknown>;
-      // Agent CRD does not store capabilities — those live under Discovery
-      if ("capabilities" in spec) {
-        delete spec.capabilities;
+      let finalSpec: Spec;
+      if (editMode === "json") {
+        finalSpec = cleanSpec(JSON.parse(specText) as Spec);
+      } else {
+        finalSpec = cleanSpec(spec);
       }
-      await api.upsertResource(ns, kind, name, version, spec);
+      await api.upsertResource(ns, kind, name, version, finalSpec);
       if (publish) {
-        await api.publishResource(ns, kind, name, version);
+        await api.publishResource(
+          ns,
+          kind,
+          name,
+          version,
+          kind === "Agent" && evalSuiteRef.trim() ? evalSuiteRef.trim() : undefined,
+        );
         setStatus(`Published ${kind}/${name}@${version} — open Resources to see it`);
         onPublished?.();
         const refreshed = await api.listResources(ns);
@@ -663,14 +1121,60 @@ function EditorView({
     }
   }
 
+  async function testAgent() {
+    setTestBusy(true);
+    setTestResult(null);
+    try {
+      const input = JSON.parse(testInput) as Record<string, unknown>;
+      const result = await api.runResource(ns, `agents/${name}`, input);
+      setTestResult(result as unknown as Record<string, unknown>);
+    } catch (e) {
+      onError(
+        `${String((e as Error).message ?? e)}. Save & publish this agent before testing it.`,
+      );
+    } finally {
+      setTestBusy(false);
+    }
+  }
+
+  async function runSuiteEval() {
+    setEvalBusy(true);
+    setEvalResult(null);
+    try {
+      // Persist draft so the runner can load suiteVersion if not yet published.
+      let finalSpec: Spec;
+      if (editMode === "json") {
+        finalSpec = cleanSpec(JSON.parse(specText) as Spec);
+      } else {
+        finalSpec = cleanSpec(spec);
+      }
+      await api.upsertResource(ns, kind, name, version, finalSpec);
+      const result = await api.runEvaluation(ns, {
+        suiteRef: `evaluationsuites/${name}`,
+        targetRef: evalTarget.trim() || "agents/support-agent",
+        targetVersion: version,
+        suiteVersion: version,
+      });
+      setEvalResult(result as unknown as Record<string, unknown>);
+      setStatus(
+        result.passed
+          ? `Eval passed (overall ${result.overall.toFixed(2)})`
+          : `Eval failed: ${result.gateReason ?? "gate"}`,
+      );
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setEvalBusy(false);
+    }
+  }
+
   return (
     <section>
       <header className="page-header">
         <h1>Resource editor</h1>
         <p className="muted">
-          Drafts stay here until you <strong>Save & publish</strong>. Published items appear under{" "}
-          <strong>Resources</strong>. Agent capabilities are managed in <strong>Discovery</strong>,
-          not in the Agent spec.
+          Use the <strong>Form</strong> tab to configure visually — generated JSON appears below.
+          Switch to <strong>JSON</strong> for advanced edits. Then <strong>Save & publish</strong>.
         </p>
       </header>
       <div className="form-row">
@@ -687,7 +1191,7 @@ function EditorView({
             </option>
           ))}
         </select>
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+        <select value={kind} onChange={(e) => onKindChange(e.target.value)}>
           {[
             "Agent",
             "Prompt",
@@ -696,6 +1200,9 @@ function EditorView({
             "ModelRoute",
             "Workflow",
             "KnowledgeSource",
+            "MemoryProfile",
+            "Environment",
+            "EvaluationSuite",
             "Policy",
             "Guardrail",
           ].map((k) => (
@@ -707,12 +1214,76 @@ function EditorView({
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="name" />
         <input value={version} onChange={(e) => setVersion(e.target.value)} placeholder="version" />
       </div>
-      <textarea
-        className="code editor"
-        value={specText}
-        onChange={(e) => setSpecText(e.target.value)}
-        spellCheck={false}
-      />
+
+      <div className="tabs editor-tabs">
+        <button
+          className={editMode === "form" ? "active" : ""}
+          disabled={!hasVisualForm(kind)}
+          onClick={switchToForm}
+        >
+          Form
+        </button>
+        <button className={editMode === "json" ? "active" : ""} onClick={switchToJson}>
+          JSON
+        </button>
+      </div>
+
+      <div className="editor-split">
+        <div className="panel editor-form-panel">
+          {editMode === "form" ? (
+            <ResourceSpecForm
+              kind={kind}
+              spec={spec}
+              onChange={onFormSpecChange}
+              resources={existing}
+            />
+          ) : (
+            <textarea
+              className="code editor"
+              value={specText}
+              onChange={(e) => setSpecText(e.target.value)}
+              spellCheck={false}
+            />
+          )}
+        </div>
+        <div className="panel editor-preview-panel">
+          <div className="form-section-title">Generated spec (preview)</div>
+          <p className="muted form-hint">
+            This is what gets saved when you publish — same as YAML without the metadata wrapper.
+          </p>
+          <pre className="code small preview-json">
+            {editMode === "json"
+              ? specText
+              : JSON.stringify(cleanSpec(spec), null, 2)}
+          </pre>
+          <div className="form-section-title" style={{ marginTop: "1rem" }}>
+            Full CRD document
+          </div>
+          <pre className="code small preview-json">
+            {(() => {
+              try {
+                const s =
+                  editMode === "json"
+                    ? (JSON.parse(specText || "{}") as Spec)
+                    : cleanSpec(spec);
+                return JSON.stringify(
+                  {
+                    apiVersion: "platform.ai/v1",
+                    kind,
+                    metadata: { name, namespace: ns, version },
+                    spec: s,
+                  },
+                  null,
+                  2,
+                );
+              } catch {
+                return "// fix JSON syntax to preview full document";
+              }
+            })()}
+          </pre>
+        </div>
+      </div>
+
       <div className="toolbar" style={{ marginTop: "0.75rem" }}>
         <button className="primary" disabled={busy} onClick={() => save(true)}>
           Save & publish
@@ -720,7 +1291,186 @@ function EditorView({
         <button disabled={busy} onClick={() => save(false)}>
           Save draft only
         </button>
+        {kind === "Agent" && (
+          <button disabled={testBusy} onClick={testAgent}>
+            {testBusy ? "Testing…" : "Test published agent"}
+          </button>
+        )}
+        {kind === "EvaluationSuite" && (
+          <button disabled={evalBusy} onClick={runSuiteEval}>
+            {evalBusy ? "Evaluating…" : "Run evaluation"}
+          </button>
+        )}
         {status && <span className="badge ok">{status}</span>}
+      </div>
+      {kind === "Agent" && (
+        <div className="form-row" style={{ marginTop: "0.5rem" }}>
+          <label className="muted">
+            Optional eval suite on publish{" "}
+            <input
+              value={evalSuiteRef}
+              onChange={(e) => setEvalSuiteRef(e.target.value)}
+              placeholder="evaluationsuites/support-quality (or leave blank for triggers)"
+              style={{ minWidth: "22rem" }}
+            />
+          </label>
+        </div>
+      )}
+      {kind === "Agent" && (
+        <div className="panel test-agent-panel">
+          <div>
+            <div className="form-section-title">Test input</div>
+            <p className="muted form-hint">
+              Runs the currently published <span className="mono">agents/{name}</span>.
+            </p>
+            <textarea
+              className="code editor test-input"
+              value={testInput}
+              onChange={(e) => setTestInput(e.target.value)}
+              spellCheck={false}
+            />
+          </div>
+          <div>
+            <div className="form-section-title">Run result</div>
+            <pre className="code test-result">
+              {testResult
+                ? JSON.stringify(testResult, null, 2)
+                : "Run the published agent to see tokens, tool calls, or errors."}
+            </pre>
+          </div>
+        </div>
+      )}
+      {kind === "EvaluationSuite" && (
+        <div className="panel test-agent-panel">
+          <div>
+            <div className="form-section-title">Eval target</div>
+            <p className="muted form-hint">
+              Runs judges against a published agent (or the draft suite cases offline).
+            </p>
+            <input
+              value={evalTarget}
+              onChange={(e) => setEvalTarget(e.target.value)}
+              placeholder="agents/support-agent"
+            />
+          </div>
+          <div>
+            <div className="form-section-title">Eval result</div>
+            <pre className="code test-result">
+              {evalResult
+                ? JSON.stringify(evalResult, null, 2)
+                : "Run evaluation to see scores, gate reason, and per-case judge details."}
+            </pre>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [resources, setResources] = useState<Resource[]>([]);
+  const [agentRef, setAgentRef] = useState("agents/multi-support-agent");
+  const [input, setInput] = useState('{"message":"Plan then answer a billing refund request"}');
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api
+      .listResources(ns)
+      .then((r) => {
+        setResources(r.resources);
+        const collabAgents = r.resources.filter(
+          (x) =>
+            x.kind === "Agent" &&
+            Boolean((x.spec as Spec).collaboration || (x.spec as Spec).supervisorRef),
+        );
+        if (collabAgents[0]) {
+          setAgentRef(`agents/${collabAgents[0].name}`);
+        }
+      })
+      .catch((e) => onError(String(e.message ?? e)));
+  }, [ns, onError]);
+
+  const agents = resources.filter((r) => r.kind === "Agent");
+  const selected = agents.find((a) => `agents/${a.name}` === agentRef);
+  const collab = (selected?.spec as Spec | undefined)?.collaboration as Spec | undefined;
+
+  async function run() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const payload = JSON.parse(input) as Record<string, unknown>;
+      const r = await api.runResource(ns, agentRef, payload, true);
+      setResult(r as unknown as Record<string, unknown>);
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <header className="page-header">
+        <h1>Multi-agent collaboration</h1>
+        <p className="muted">
+          Run planner/executor/reviewer, supervisor/workers, or peer patterns defined on an Agent
+          CRD. Orchestrator uses collaboration when present (or force via multiAgent).
+        </p>
+      </header>
+      <div className="form-row">
+        <select value={agentRef} onChange={(e) => setAgentRef(e.target.value)}>
+          {agents.map((a) => (
+            <option key={a.name} value={`agents/${a.name}`}>
+              agents/{a.name}
+              {(a.spec as Spec).collaboration ? " · collab" : ""}
+            </option>
+          ))}
+        </select>
+        <button className="primary" disabled={busy || agents.length === 0} onClick={run}>
+          {busy ? "Running…" : "Run collaboration"}
+        </button>
+      </div>
+      {collab ? (
+        <div className="panel" style={{ marginBottom: "1rem" }}>
+          <div className="form-section-title">
+            Pattern <span className="badge">{String(collab.pattern)}</span>
+          </div>
+          <dl className="inspector-meta">
+            <dt>Max iterations</dt>
+            <dd>{String(collab.maxIterations ?? 3)}</dd>
+            <dt>Shared context</dt>
+            <dd>{String(collab.sharedContext ?? true)}</dd>
+            <dt>Agents</dt>
+            <dd className="mono">{JSON.stringify(collab.agents ?? {})}</dd>
+          </dl>
+          <AgentGraph resources={resources} />
+        </div>
+      ) : (
+        <p className="muted">
+          Selected agent has no <span className="mono">collaboration</span> block — run still
+          forces multi-agent mode (falls back to single if no pattern is discovered). Add a
+          pattern in the Resource editor Agent form.
+        </p>
+      )}
+      <div className="panel test-agent-panel">
+        <div>
+          <div className="form-section-title">Input</div>
+          <textarea
+            className="code editor test-input"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            spellCheck={false}
+          />
+        </div>
+        <div>
+          <div className="form-section-title">Result steps</div>
+          <pre className="code test-result">
+            {result
+              ? JSON.stringify(result, null, 2)
+              : "Run to see pattern, iterations, and per-role steps."}
+          </pre>
+        </div>
       </div>
     </section>
   );
@@ -826,12 +1576,22 @@ function TracesView({ ns, onError }: { ns: string; onError: (e: string) => void 
 
 function DiscoveryView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
   const [agents, setAgents] = useState<DiscoveredAgent[]>([]);
+  const [publishedAgents, setPublishedAgents] = useState<Resource[]>([]);
   const [cap, setCap] = useState("research");
+  const [registerRef, setRegisterRef] = useState("agents/support-agent");
+  const [registerAddress, setRegisterAddress] = useState("support@platform.local");
+  const [registerCaps, setRegisterCaps] = useState("support, refund");
+  const [registerSchemas, setRegisterSchemas] = useState("");
+  const [deliveryMode, setDeliveryMode] = useState("pull");
+  const [registering, setRegistering] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    api
-      .listAgents(ns)
-      .then((r) => setAgents(r.agents))
+    Promise.all([api.listAgents(ns), api.listResources(ns)])
+      .then(([discovery, catalog]) => {
+        setAgents(discovery.agents);
+        setPublishedAgents(catalog.resources.filter((resource) => resource.kind === "Agent"));
+      })
       .catch((e) => onError(String(e.message ?? e)));
   }, [ns, onError]);
 
@@ -875,6 +1635,104 @@ function DiscoveryView({ ns, onError }: { ns: string; onError: (e: string) => vo
         </button>
         <button onClick={load}>List all</button>
       </div>
+
+      <div className="panel discovery-register">
+        <div>
+          <h2>Register capabilities</h2>
+          <p className="muted">
+            Add or update what a published agent can handle. This powers capability routing.
+          </p>
+        </div>
+        <div className="resource-form">
+          <label className="form-field">
+            <span className="form-label">Agent</span>
+            <select
+              value={registerRef}
+              onChange={(e) => {
+                const ref = e.target.value;
+                setRegisterRef(ref);
+                setRegisterAddress(`${ref.replace("agents/", "")}@platform.local`);
+              }}
+            >
+              {publishedAgents.map((agent) => (
+                <option key={agent.name} value={`agents/${agent.name}`}>
+                  agents/{agent.name}
+                </option>
+              ))}
+              {registerRef &&
+                !publishedAgents.some((agent) => `agents/${agent.name}` === registerRef) && (
+                  <option value={registerRef}>{registerRef}</option>
+                )}
+            </select>
+          </label>
+          <label className="form-field">
+            <span className="form-label">Address</span>
+            <input
+              value={registerAddress}
+              onChange={(e) => setRegisterAddress(e.target.value)}
+              placeholder="support@platform.local"
+            />
+          </label>
+          <label className="form-field">
+            <span className="form-label">Capabilities</span>
+            <span className="form-hint muted">Comma-separated, e.g. support, refund</span>
+            <input
+              value={registerCaps}
+              onChange={(e) => setRegisterCaps(e.target.value)}
+              placeholder="support, refund"
+            />
+          </label>
+          <label className="form-field">
+            <span className="form-label">Input/output schemas (optional)</span>
+            <span className="form-hint muted">Comma-separated schema refs</span>
+            <input
+              value={registerSchemas}
+              onChange={(e) => setRegisterSchemas(e.target.value)}
+              placeholder="schemas/support-request"
+            />
+          </label>
+          <label className="form-field">
+            <span className="form-label">Delivery mode</span>
+            <select value={deliveryMode} onChange={(e) => setDeliveryMode(e.target.value)}>
+              <option value="pull">pull</option>
+              <option value="push">push</option>
+            </select>
+          </label>
+          <button
+            className="primary"
+            disabled={registering || !registerRef || !registerCaps.trim()}
+            onClick={async () => {
+              setRegistering(true);
+              setNotice(null);
+              try {
+                await api.registerCapability(ns, {
+                  agent_ref: registerRef,
+                  address: registerAddress || undefined,
+                  capabilities: registerCaps
+                    .split(",")
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                  schemas: registerSchemas
+                    .split(",")
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                  delivery_mode: deliveryMode,
+                });
+                setNotice(`Registered capabilities for ${registerRef}`);
+                load();
+              } catch (e) {
+                onError(String((e as Error).message ?? e));
+              } finally {
+                setRegistering(false);
+              }
+            }}
+          >
+            {registering ? "Registering…" : "Register / update"}
+          </button>
+          {notice && <span className="badge ok">{notice}</span>}
+        </div>
+      </div>
+
       <DiscoveryMap agents={agents} />
       <div className="panel list" style={{ marginTop: "1rem" }}>
         {agents.map((a) => (
@@ -890,7 +1748,15 @@ function DiscoveryView({ ns, onError }: { ns: string; onError: (e: string) => vo
   );
 }
 
-function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+function WorkflowsView({
+  ns,
+  onError,
+  go,
+}: {
+  ns: string;
+  onError: (e: string) => void;
+  go: (v: View) => void;
+}) {
   const [goal, setGoal] = useState("Research market data across competitors");
   const [plan, setPlan] = useState<{
     workflow_id: string;
@@ -898,6 +1764,8 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
     ir: {
       name: string;
       description?: string;
+      plannerBackend?: string;
+      planner_backend?: string;
       steps: Array<{
         id: string;
         type: string;
@@ -910,6 +1778,7 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [published, setPublished] = useState<Resource[]>([]);
+  const [plannerMode, setPlannerMode] = useState<"auto" | "llm" | "heuristic">("auto");
 
   useEffect(() => {
     api
@@ -923,8 +1792,8 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
       <header className="page-header">
         <h1>Dynamic flows</h1>
         <p className="muted">
-          Describe a goal — the planner builds a step graph, then runs it. Diagram updates when the
-          plan returns.
+          Describe a goal — the <strong>LLM planner</strong> builds a step graph (heuristic
+          fallback if needed), then runs it.
         </p>
       </header>
 
@@ -953,6 +1822,14 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
 
       <textarea rows={3} value={goal} onChange={(e) => setGoal(e.target.value)} />
       <div className="toolbar" style={{ marginTop: "0.75rem" }}>
+        <select
+          value={plannerMode}
+          onChange={(e) => setPlannerMode(e.target.value as "auto" | "llm" | "heuristic")}
+        >
+          <option value="auto">Planner: auto (LLM → heuristic)</option>
+          <option value="llm">Planner: LLM only</option>
+          <option value="heuristic">Planner: heuristic only</option>
+        </select>
         <button
           className="primary"
           disabled={busy}
@@ -960,7 +1837,7 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
             setBusy(true);
             setPlan(null);
             try {
-              setPlan(await api.planWorkflow(ns, goal));
+              setPlan(await api.planWorkflow(ns, goal, plannerMode));
             } catch (e) {
               onError(String((e as Error).message ?? e));
             } finally {
@@ -975,7 +1852,9 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
       {plan && (
         <>
           <FlowLane
-            title={`Plan · ${plan.ir.name} · ${plan.status}`}
+            title={`Plan · ${plan.ir.name} · ${plan.status} · ${
+              plan.ir.plannerBackend ?? plan.ir.planner_backend ?? "planner"
+            }`}
             nodes={workflowToNodes({ steps: plan.ir.steps }).map((n) => {
               if (plan.status === "failed" && n.id === String(plan.output?.step ?? "")) {
                 return { ...n, status: "failed" };
@@ -987,7 +1866,61 @@ function WorkflowsView({ ns, onError }: { ns: string; onError: (e: string) => vo
           <pre className="code">{JSON.stringify(plan, null, 2)}</pre>
         </>
       )}
+
+      <HitlPanel ns={ns} onError={onError} go={go} />
     </section>
+  );
+}
+
+function HitlPanel({
+  ns,
+  onError,
+  go,
+}: {
+  ns: string;
+  onError: (e: string) => void;
+  go: (v: View) => void;
+}) {
+  const [runId, setRunId] = useState("");
+  const [hitlResult, setHitlResult] = useState<string | null>(null);
+  return (
+    <div className="panel" style={{ marginTop: "1.5rem" }}>
+      <div className="form-section-title">Human approval (HITL)</div>
+      <p className="muted">
+        Approve or resume a paused durable workflow run by id, or open the full inbox.
+      </p>
+      <div className="form-row">
+        <input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="run id" />
+        <button
+          disabled={!runId}
+          onClick={async () => {
+            try {
+              setHitlResult(JSON.stringify(await api.approveWorkflow(runId, "approved"), null, 2));
+            } catch (e) {
+              onError(String((e as Error).message ?? e));
+            }
+          }}
+        >
+          Approve
+        </button>
+        <button
+          disabled={!runId}
+          onClick={async () => {
+            try {
+              setHitlResult(JSON.stringify(await api.resumeWorkflow(runId, ns), null, 2));
+            } catch (e) {
+              onError(String((e as Error).message ?? e));
+            }
+          }}
+        >
+          Resume
+        </button>
+        <button className="ghost" onClick={() => go("hitl")}>
+          Open inbox
+        </button>
+      </div>
+      {hitlResult && <pre className="code">{hitlResult}</pre>}
+    </div>
   );
 }
 
@@ -1075,8 +2008,11 @@ function MessagingView({ ns, onError }: { ns: string; onError: (e: string) => vo
 
 function SecretsView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
   const [secrets, setSecrets] = useState<SecretMeta[]>([]);
-  const [name, setName] = useState("openai-key");
+  const [name, setName] = useState("OPENAI_API_KEY");
   const [value, setValue] = useState("");
+  const [visible, setVisible] = useState(false);
+  const [storing, setStoring] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api
@@ -1097,29 +2033,58 @@ function SecretsView({ ns, onError }: { ns: string; onError: (e: string) => void
           Encrypted at rest. Reference as <span className="mono">secrets/name</span> from tools.
         </p>
       </header>
-      <div className="form-row">
-        <input value={name} onChange={(e) => setName(e.target.value)} />
-        <input
-          type="password"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="value"
-        />
-        <button
-          className="primary"
-          disabled={!value}
-          onClick={async () => {
-            try {
-              await api.putSecret(ns, name, value);
-              setValue("");
-              load();
-            } catch (e) {
-              onError(String((e as Error).message ?? e));
-            }
-          }}
-        >
-          Store
-        </button>
+      <div className="panel secret-create-panel">
+        <div>
+          <h2>Add or rotate a secret</h2>
+          <p className="muted">
+            Values are encrypted and never returned by the list API. Reusing a name rotates it.
+          </p>
+        </div>
+        <div className="form-row secret-form-row">
+          <label className="form-field">
+            <span className="form-label">Secret name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="OPENAI_API_KEY"
+            />
+          </label>
+          <label className="form-field">
+            <span className="form-label">Secret value</span>
+            <input
+              type={visible ? "text" : "password"}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder="Paste value"
+              autoComplete="new-password"
+            />
+          </label>
+          <button type="button" onClick={() => setVisible((current) => !current)}>
+            {visible ? "Hide" : "Show"}
+          </button>
+          <button
+            className="primary"
+            disabled={storing || !name.trim() || !value}
+            onClick={async () => {
+              setStoring(true);
+              setNotice(null);
+              try {
+                await api.putSecret(ns, name.trim(), value);
+                setValue("");
+                setVisible(false);
+                setNotice(`Stored secrets/${name.trim()}`);
+                load();
+              } catch (e) {
+                onError(String((e as Error).message ?? e));
+              } finally {
+                setStoring(false);
+              }
+            }}
+          >
+            {storing ? "Encrypting…" : "Store secret"}
+          </button>
+        </div>
+        {notice && <span className="badge ok">{notice}</span>}
       </div>
       <div className="panel list">
         {secrets.map((s) => (
@@ -1306,8 +2271,19 @@ function FederationView({ ns, onError }: { ns: string; onError: (e: string) => v
   );
 }
 
-function ComplianceView({ onError }: { onError: (e: string) => void }) {
+function ComplianceView({
+  ns,
+  user,
+  onError,
+}: {
+  ns: string;
+  user: AuthUser | null;
+  onError: (e: string) => void;
+}) {
   const [packs, setPacks] = useState<CompliancePack[]>([]);
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
   useEffect(() => {
     api
       .listCompliance()
@@ -1319,8 +2295,9 @@ function ComplianceView({ onError }: { onError: (e: string) => void }) {
     <section>
       <header className="page-header">
         <h1>Compliance packs</h1>
-        <p className="muted">HIPAA, PCI, GDPR, SOC2 bundles.</p>
+        <p className="muted">Install HIPAA, PCI, GDPR, SOC2 baseline policies into the namespace.</p>
       </header>
+      {status && <p className="muted">{status}</p>}
       <div className="pack-grid">
         {packs.map((p) => (
           <div key={p.id} className="pack">
@@ -1330,8 +2307,1113 @@ function ComplianceView({ onError }: { onError: (e: string) => void }) {
             <span className="mono muted">
               {p.id} · v{p.version}
             </span>
+            <button
+              className="primary"
+              style={{ marginTop: "0.75rem" }}
+              disabled={busy === p.id}
+              onClick={async () => {
+                setBusy(p.id);
+                setStatus(null);
+                try {
+                  const r = await api.installCompliance(ns, p.id, user?.email);
+                  setStatus(`Installed ${p.id}: ${JSON.stringify(r)}`);
+                } catch (e) {
+                  onError(String((e as Error).message ?? e));
+                } finally {
+                  setBusy(null);
+                }
+              }}
+            >
+              {busy === p.id ? "Installing…" : "Install into namespace"}
+            </button>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function PromotionView({
+  ns,
+  user,
+  onError,
+}: {
+  ns: string;
+  user: AuthUser | null;
+  onError: (e: string) => void;
+}) {
+  const [fromEnv, setFromEnv] = useState("development");
+  const [toEnv, setToEnv] = useState("staging");
+  const [promoId, setPromoId] = useState("");
+  const [result, setResult] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const who = user?.email ?? "console";
+
+  return (
+    <section>
+      <header className="page-header">
+        <h1>Environment promotion</h1>
+        <p className="muted">
+          Move published bundles across environments. If the target Environment CRD requires
+          approval, approve the promotion id below.
+        </p>
+      </header>
+      <div className="form-row">
+        <input value={fromEnv} onChange={(e) => setFromEnv(e.target.value)} placeholder="from env" />
+        <input value={toEnv} onChange={(e) => setToEnv(e.target.value)} placeholder="to env" />
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              const r = await api.promote(ns, fromEnv, toEnv, who);
+              setPromoId(r.promotionId);
+              setResult(JSON.stringify(r, null, 2));
+            } catch (e) {
+              onError(String((e as Error).message ?? e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Request promote
+        </button>
+      </div>
+      <div className="form-row" style={{ marginTop: "0.75rem" }}>
+        <input
+          value={promoId}
+          onChange={(e) => setPromoId(e.target.value)}
+          placeholder="promotion id"
+        />
+        <button
+          disabled={!promoId || busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              const r = await api.approvePromotion(promoId, who);
+              setResult(JSON.stringify(r, null, 2));
+            } catch (e) {
+              onError(String((e as Error).message ?? e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Approve promotion
+        </button>
+      </div>
+      {result && <pre className="code" style={{ marginTop: "1rem" }}>{result}</pre>}
+    </section>
+  );
+}
+
+function MarketplaceView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [plugins, setPlugins] = useState<MarketplacePlugin[]>([]);
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    api
+      .listMarketplace()
+      .then((r) => setPlugins(r.plugins))
+      .catch((e) => onError(String(e.message ?? e)));
+  }, [onError]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>Marketplace</h1>
+          <p className="muted">Install verified plugins into this namespace.</p>
+        </div>
+        <button onClick={load}>Refresh</button>
+      </header>
+      {status && <p className="muted">{status}</p>}
+      <div className="pack-grid">
+        {plugins.map((p) => (
+          <div key={p.id ?? p.name} className="pack">
+            {p.tier && <div className="badge">{p.tier}</div>}
+            <h3>{p.name}</h3>
+            <p className="muted">{p.description ?? "Plugin pack"}</p>
+            <span className="mono muted">v{p.version ?? "—"}</span>
+            <button
+              className="primary"
+              style={{ marginTop: "0.75rem" }}
+              disabled={busy === p.name}
+              onClick={async () => {
+                setBusy(p.name);
+                try {
+                  const r = await api.installMarketplace(ns, p.name, p.version);
+                  setStatus(`Installed ${p.name}: ${JSON.stringify(r)}`);
+                } catch (e) {
+                  onError(String((e as Error).message ?? e));
+                } finally {
+                  setBusy(null);
+                }
+              }}
+            >
+              {busy === p.name ? "Installing…" : "Install"}
+            </button>
+          </div>
+        ))}
+        {plugins.length === 0 && (
+          <p className="muted">No plugins published yet. Use the API to publish a plugin manifest.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function pct(rate: number) {
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+function EvaluationsView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [suiteRef, setSuiteRef] = useState("evaluationsuites/support-quality");
+  const [targetRef, setTargetRef] = useState("agents/support-agent");
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [runs, setRuns] = useState<Record<string, unknown>[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api
+      .recentEvaluations(ns)
+      .then((r) => setRuns(r.runs))
+      .catch((e) => onError(String(e.message ?? e)));
+  }, [ns, onError]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function run() {
+    setBusy(true);
+    try {
+      const r = await api.runEvaluation(ns, { suiteRef, targetRef });
+      setResult(r as unknown as Record<string, unknown>);
+      load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <header className="page-header">
+        <h1>Evaluations</h1>
+        <p className="muted">
+          Dry-run publish quality gates with keyword, latency, tool accuracy, and LLM judges.
+        </p>
+      </header>
+      <div className="form-row">
+        <input
+          value={suiteRef}
+          onChange={(e) => setSuiteRef(e.target.value)}
+          placeholder="evaluationsuites/support-quality"
+        />
+        <input
+          value={targetRef}
+          onChange={(e) => setTargetRef(e.target.value)}
+          placeholder="agents/support-agent"
+        />
+        <button className="primary" disabled={busy} onClick={run}>
+          {busy ? "Running…" : "Run suite"}
+        </button>
+      </div>
+      {result && (
+        <div className="panel" style={{ marginTop: "1rem" }}>
+          <div className="form-section-title">
+            Latest run{" "}
+            <span className={`badge ${result.passed ? "ok" : ""}`}>
+              {result.passed ? "passed" : "failed"}
+            </span>
+          </div>
+          <pre className="code small">{JSON.stringify(result, null, 2)}</pre>
+        </div>
+      )}
+      <div className="panel" style={{ marginTop: "1rem" }}>
+        <div className="form-section-title">Recent runs</div>
+        {runs.length === 0 ? (
+          <p className="muted">No evaluation runs yet.</p>
+        ) : (
+          <ul className="plain-list">
+            {runs.map((r) => (
+              <li key={String(r.runId)}>
+                <span className="mono">{String(r.targetRef)}</span>{" "}
+                <span className={`badge ${r.passed ? "ok" : ""}`}>
+                  {r.passed ? "pass" : "fail"}
+                </span>{" "}
+                overall {Number(r.overall ?? 0).toFixed(2)}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function GitSyncView({
+  ns,
+  user,
+  onError,
+}: {
+  ns: string;
+  user: AuthUser | null;
+  onError: (e: string) => void;
+}) {
+  const [directory, setDirectory] = useState("examples/resources");
+  const [exportDir, setExportDir] = useState("./export");
+  const [publish, setPublish] = useState(true);
+  const [result, setResult] = useState<string | null>(null);
+  const [repos, setRepos] = useState<
+    Array<{
+      id: string;
+      repoPath: string;
+      branch: string;
+      lastSyncAt: string | null;
+      lastCommit: string | null;
+      status: string;
+    }>
+  >([]);
+  const [busy, setBusy] = useState(false);
+
+  const loadRepos = useCallback(() => {
+    api
+      .listGitRepos(ns)
+      .then((r) => setRepos(r.repos))
+      .catch((e) => onError(String(e.message ?? e)));
+  }, [ns, onError]);
+
+  useEffect(() => {
+    loadRepos();
+  }, [loadRepos]);
+
+  async function syncFromDir() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await api.gitSync(ns, {
+        directory,
+        publish,
+        author: user?.email ?? "console",
+      });
+      setResult(JSON.stringify(r, null, 2));
+      loadRepos();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportYaml() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await api.gitExport(ns, exportDir);
+      setResult(JSON.stringify(r, null, 2));
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <header className="page-header">
+        <h1>Git sync</h1>
+        <p className="muted">
+          Apply CRD YAML from a local directory into the registry, or export published resources
+          back to YAML for git.
+        </p>
+      </header>
+
+      <div className="panel">
+        <div className="form-section-title">Sync from directory</div>
+        <p className="muted form-hint">
+          Path is resolved on the API host (e.g. <span className="mono">examples/resources</span>).
+        </p>
+        <div className="form-row">
+          <input
+            value={directory}
+            onChange={(e) => setDirectory(e.target.value)}
+            placeholder="examples/resources"
+            style={{ minWidth: "18rem" }}
+          />
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={publish}
+              onChange={(e) => setPublish(e.target.checked)}
+            />
+            Publish after apply
+          </label>
+          <button className="primary" disabled={busy} onClick={syncFromDir}>
+            {busy ? "Working…" : "Sync now"}
+          </button>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: "1rem" }}>
+        <div className="form-section-title">Export published → YAML</div>
+        <div className="form-row">
+          <input
+            value={exportDir}
+            onChange={(e) => setExportDir(e.target.value)}
+            placeholder="./export"
+          />
+          <button disabled={busy} onClick={exportYaml}>
+            Export YAML
+          </button>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: "1rem" }}>
+        <div className="form-section-title">Registered sync paths</div>
+        {repos.length === 0 ? (
+          <p className="muted">No syncs yet.</p>
+        ) : (
+          <div className="list">
+            {repos.map((r) => (
+              <div key={r.id} className="list-item static">
+                <div>
+                  <span className="mono">{r.repoPath}</span>
+                  <div className="muted">
+                    {r.branch} · {r.status}
+                    {r.lastCommit ? ` · ${r.lastCommit}` : ""}
+                    {r.lastSyncAt ? ` · ${r.lastSyncAt}` : ""}
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setDirectory(r.repoPath);
+                  }}
+                >
+                  Use path
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {result && (
+        <pre className="code" style={{ marginTop: "1rem" }}>
+          {result}
+        </pre>
+      )}
+    </section>
+  );
+}
+
+function TerraformView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [directory, setDirectory] = useState("./terraform");
+  const [files, setFiles] = useState<Record<string, string>>({});
+  const [selected, setSelected] = useState<string>("provider.tf");
+  const [resourceCount, setResourceCount] = useState(0);
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const loadPreview = useCallback(async () => {
+    try {
+      const r = await api.terraformPreview(ns);
+      setFiles(r.files);
+      setResourceCount(r.resourceCount);
+      const names = Object.keys(r.files);
+      setSelected((prev) => (names.includes(prev) ? prev : names[0] ?? "provider.tf"));
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }, [ns, onError]);
+
+  useEffect(() => {
+    void loadPreview();
+  }, [loadPreview]);
+
+  async function exportToDisk() {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const r = await api.terraformExport(ns, directory, true);
+      setStatus(`Wrote ${r.exported} resource file(s) to ${r.directory}`);
+      if (r.preview) {
+        setFiles((prev) => ({ ...prev, ...r.preview }));
+      }
+      await loadPreview();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const fileNames = Object.keys(files).sort((a, b) => {
+    const rank = (n: string) =>
+      n === "provider.tf" ? 0 : n === "variables.tf" ? 1 : n === "exported.json" ? 99 : 2;
+    return rank(a) - rank(b) || a.localeCompare(b);
+  });
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>Terraform</h1>
+          <p className="muted">
+            Preview and export published resources as HCL / terraform-json for IaC pipelines.
+          </p>
+        </div>
+        <button disabled={busy} onClick={() => void loadPreview()}>
+          Refresh preview
+        </button>
+      </header>
+
+      <div className="form-row">
+        <span className="badge">{resourceCount} resources</span>
+        <input
+          value={directory}
+          onChange={(e) => setDirectory(e.target.value)}
+          placeholder="./terraform"
+        />
+        <button className="primary" disabled={busy} onClick={exportToDisk}>
+          {busy ? "Writing…" : "Write to disk"}
+        </button>
+        {status && <span className="badge ok">{status}</span>}
+      </div>
+
+      {fileNames.length === 0 ? (
+        <p className="muted" style={{ marginTop: "1rem" }}>
+          No published resources to export. Publish agents/prompts first, or sync from{" "}
+          <span className="mono">examples/resources</span>.
+        </p>
+      ) : (
+        <div className="editor-split" style={{ marginTop: "1rem" }}>
+          <div className="panel">
+            <div className="form-section-title">Files</div>
+            <div className="list">
+              {fileNames.map((name) => (
+                <button
+                  key={name}
+                  className={`list-item ${selected === name ? "active" : ""}`}
+                  onClick={() => setSelected(name)}
+                  style={{ width: "100%", textAlign: "left" }}
+                >
+                  <span className="mono">{name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="panel">
+            <div className="form-section-title">{selected}</div>
+            <pre className="code small preview-json">{files[selected] ?? ""}</pre>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function HitlInboxView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [items, setItems] = useState<HitlInboxItem[]>([]);
+  const [selected, setSelected] = useState<HitlInboxItem | null>(null);
+  const [detail, setDetail] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [scopeNs, setScopeNs] = useState(true);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.listHitlInbox(scopeNs ? ns : undefined, 50);
+      setItems(r.items);
+      setSelected((prev) => {
+        if (!prev) return null;
+        return r.items.find((i) => i.runId === prev.runId) ?? null;
+      });
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }, [ns, onError, scopeNs]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function openRun(item: HitlInboxItem) {
+    setSelected(item);
+    try {
+      const full = await api.getWorkflowRun(item.runId);
+      setDetail(JSON.stringify(full, null, 2));
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }
+
+  async function act(decision: "approved" | "rejected") {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const approved = await api.approveWorkflow(selected.runId, decision);
+      let result: Record<string, unknown> = approved;
+      if (decision === "approved") {
+        result = await api.resumeWorkflow(selected.runId, ns);
+      }
+      setDetail(JSON.stringify(result, null, 2));
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>HITL inbox</h1>
+          <p className="muted">
+            Workflow runs waiting on human approval or rate-limit override. Approve + resume, or
+            reject.
+          </p>
+        </div>
+        <div className="form-row">
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={scopeNs}
+              onChange={(e) => setScopeNs(e.target.checked)}
+            />
+            This namespace only
+          </label>
+          <button onClick={() => void load()}>Refresh</button>
+        </div>
+      </header>
+
+      <div className="metric-grid" style={{ marginBottom: "1rem" }}>
+        <div className="metric-card">
+          <div className="metric-label">Waiting</div>
+          <div className="metric-value">{items.length}</div>
+          <div className="muted mono">{scopeNs ? ns : "all namespaces"}</div>
+        </div>
+      </div>
+
+      <div className="split">
+        <div className="panel list">
+          <div className="form-section-title">Pending runs</div>
+          {items.length === 0 ? (
+            <p className="muted" style={{ padding: "0.75rem" }}>
+              No runs waiting for approval.
+            </p>
+          ) : (
+            items.map((item) => {
+              const pending = item.pendingApproval;
+              const step =
+                pending?.step_id ?? item.currentStepId ?? "—";
+              const reason = pending?.reason ?? "approval_required";
+              return (
+                <button
+                  key={item.runId}
+                  className={
+                    selected?.runId === item.runId ? "list-item active" : "list-item"
+                  }
+                  data-testid={`hitl-run-${item.runId}`}
+                  onClick={() => void openRun(item)}
+                >
+                  <div>
+                    <div className="mono">{item.workflowRef ?? item.runId}</div>
+                    <div className="muted">
+                      step <span className="mono">{step}</span> · {reason}
+                    </div>
+                  </div>
+                  <span className="badge warn">{item.status}</span>
+                </button>
+              );
+            })
+          )}
+        </div>
+        <div className="panel">
+          <div className="form-section-title">Decision</div>
+          {!selected ? (
+            <p className="muted">Select a waiting run.</p>
+          ) : (
+            <>
+              <p className="mono">{selected.runId}</p>
+              <p className="muted">
+                {selected.workflowRef ?? "workflow"} · step{" "}
+                {selected.pendingApproval?.step_id ?? selected.currentStepId ?? "—"}
+              </p>
+              <div className="form-row" style={{ marginTop: "0.75rem" }}>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  data-testid="hitl-approve"
+                  onClick={() => void act("approved")}
+                >
+                  {busy ? "Working…" : "Approve & resume"}
+                </button>
+                <button disabled={busy} onClick={() => void act("rejected")}>
+                  Reject
+                </button>
+              </div>
+              {detail && <pre className="code" style={{ marginTop: "1rem" }}>{detail}</pre>}
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [regions, setRegions] = useState<RegionInfo[]>([]);
+  const [nodes, setNodes] = useState<EdgeNode[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [endpoint, setEndpoint] = useState("http://localhost:8082");
+  const [residency, setResidency] = useState("");
+  const [isPrimary, setIsPrimary] = useState(false);
+  const [edgeRegion, setEdgeRegion] = useState("");
+  const [cachePath, setCachePath] = useState(".platform/bundle.cache.json");
+
+  const load = useCallback(async () => {
+    try {
+      const [r, e] = await Promise.all([api.listRegions(), api.listEdgeNodes()]);
+      setRegions(r.regions);
+      setNodes(e.nodes);
+      setEdgeRegion((prev) => prev || r.regions[0]?.name || "");
+    } catch (err) {
+      onError(String((err as Error).message ?? err));
+    }
+  }, [onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function registerRegion() {
+    if (!name.trim() || !endpoint.trim()) return;
+    setBusy(true);
+    try {
+      const r = await api.registerRegion({
+        name: name.trim(),
+        endpoint: endpoint.trim(),
+        dataResidency: residency.trim() || undefined,
+        isPrimary,
+      });
+      setResult(JSON.stringify(r, null, 2));
+      setName("");
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerEdge() {
+    setBusy(true);
+    try {
+      const r = await api.registerEdgeNode({
+        namespace: ns,
+        environment: "development",
+        region: edgeRegion || undefined,
+        bundleCachePath: cachePath || undefined,
+      });
+      setResult(JSON.stringify(r, null, 2));
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const primary = regions.find((r) => r.is_primary);
+  const online = nodes.filter((n) => n.status === "online").length;
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>Regions & edge</h1>
+          <p className="muted">
+            Multi-region control-plane endpoints, failover, and edge runtime registrations.
+          </p>
+        </div>
+        <button onClick={() => void load()}>Refresh</button>
+      </header>
+
+      <div className="metric-grid">
+        <div className="metric-card">
+          <div className="metric-label">Regions</div>
+          <div className="metric-value">{regions.length}</div>
+          <div className="muted mono">primary · {primary?.name ?? "—"}</div>
+        </div>
+        <div className="metric-card">
+          <div className="metric-label">Edge nodes</div>
+          <div className="metric-value">{nodes.length}</div>
+          <div className="muted mono">{online} online</div>
+        </div>
+      </div>
+
+      <div className="split" style={{ marginTop: "1.25rem" }}>
+        <div className="panel">
+          <div className="form-section-title">Regions</div>
+          {regions.length === 0 ? (
+            <p className="muted">No regions registered.</p>
+          ) : (
+            <div className="list">
+              {regions.map((r) => (
+                <div key={r.id || r.name} className="list-item static">
+                  <div>
+                    <div>
+                      <span className="mono">{r.name}</span>{" "}
+                      {r.is_primary && <span className="badge ok">primary</span>}{" "}
+                      <span
+                        className={
+                          r.status === "active"
+                            ? "badge ok"
+                            : r.status === "offline"
+                              ? "badge danger"
+                              : "badge warn"
+                        }
+                      >
+                        {r.status}
+                      </span>
+                    </div>
+                    <div className="muted mono">{r.endpoint}</div>
+                    {r.data_residency && (
+                      <div className="muted">residency · {r.data_residency}</div>
+                    )}
+                  </div>
+                  <div className="form-row">
+                    {!r.is_primary && r.status === "active" && (
+                      <button
+                        className="ghost"
+                        disabled={busy}
+                        onClick={async () => {
+                          setBusy(true);
+                          try {
+                            setResult(
+                              JSON.stringify(await api.setPrimaryRegion(r.name), null, 2),
+                            );
+                            await load();
+                          } catch (e) {
+                            onError(String((e as Error).message ?? e));
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        Make primary
+                      </button>
+                    )}
+                    {r.is_primary && (
+                      <button
+                        disabled={busy}
+                        onClick={async () => {
+                          setBusy(true);
+                          try {
+                            setResult(
+                              JSON.stringify(await api.failoverRegion(r.name), null, 2),
+                            );
+                            await load();
+                          } catch (e) {
+                            onError(String((e as Error).message ?? e));
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        Failover
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="form-section-title">Register region</div>
+          <div className="form-stack">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="name (e.g. ap-south-1)"
+            />
+            <input
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder="endpoint URL"
+            />
+            <input
+              value={residency}
+              onChange={(e) => setResidency(e.target.value)}
+              placeholder="data residency (optional)"
+            />
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={isPrimary}
+                onChange={(e) => setIsPrimary(e.target.checked)}
+              />
+              Set as primary
+            </label>
+            <button className="primary" disabled={busy || !name.trim()} onClick={() => void registerRegion()}>
+              Register
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="split" style={{ marginTop: "1.25rem" }}>
+        <div className="panel">
+          <div className="form-section-title">Edge nodes</div>
+          {nodes.length === 0 ? (
+            <p className="muted">No edge runtimes registered yet.</p>
+          ) : (
+            <div className="list">
+              {nodes.map((n) => (
+                <div key={n.id} className="list-item static">
+                  <div>
+                    <div className="mono">{n.id}</div>
+                    <div className="muted">
+                      ns <span className="mono">{n.namespaceId}</span>
+                      {n.regionName ? ` · ${n.regionName}` : ""}
+                    </div>
+                    <div className="muted mono">
+                      sync {n.lastSyncAt ?? "—"} · telemetry {n.lastTelemetryAt ?? "—"}
+                    </div>
+                  </div>
+                  <span className={n.status === "online" ? "badge ok" : "badge warn"}>
+                    {n.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="form-section-title">Register edge node</div>
+          <p className="muted form-hint">
+            Registers against current namespace <span className="mono">{ns}</span>.
+          </p>
+          <div className="form-stack">
+            <select value={edgeRegion} onChange={(e) => setEdgeRegion(e.target.value)}>
+              <option value="">No region preference</option>
+              {regions.map((r) => (
+                <option key={r.name} value={r.name}>
+                  {r.name}
+                </option>
+              ))}
+            </select>
+            <input
+              value={cachePath}
+              onChange={(e) => setCachePath(e.target.value)}
+              placeholder="bundle cache path"
+            />
+            <button className="primary" disabled={busy} onClick={() => void registerEdge()}>
+              Register edge
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {result && <pre className="code" style={{ marginTop: "1rem" }}>{result}</pre>}
+    </section>
+  );
+}
+
+function MetricsView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [overview, setOverview] = useState<MetricStats | null>(null);
+  const [routes, setRoutes] = useState<Array<MetricStats & { routeName: string }>>([]);
+  const [candidates, setCandidates] = useState<
+    Array<MetricStats & { provider: string; model: string; key: string }>
+  >([]);
+  const [samples, setSamples] = useState<
+    Array<{
+      routeName: string;
+      provider: string;
+      model: string;
+      latencyMs: number;
+      success: boolean;
+      costUnits: number;
+      recordedAt: string;
+    }>
+  >([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [detail, setDetail] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [sampleCount, setSampleCount] = useState(0);
+
+  const load = useCallback(async () => {
+    try {
+      const [summary, recent] = await Promise.all([
+        api.metricsSummary(ns, 500),
+        api.metricsRecent(ns, 40),
+      ]);
+      setOverview(summary.overview);
+      setRoutes(summary.routes);
+      setCandidates(summary.candidates);
+      setSampleCount(summary.sampleCount);
+      setSamples(recent.samples);
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }, [ns, onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function openRoute(routeName: string) {
+    setSelected(routeName);
+    try {
+      const short = routeName.includes("/") ? routeName.split("/", 2)[1] : routeName;
+      const r = await api.metricsRoute(ns, short);
+      setDetail(JSON.stringify(r, null, 2));
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }
+
+  async function tuneSelected() {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const short = selected.includes("/") ? selected.split("/", 2)[1] : selected;
+      const r = await api.tuneModelRoute(ns, short, true);
+      setDetail(JSON.stringify(r, null, 2));
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const maxReq = Math.max(1, ...candidates.map((c) => c.requests));
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>Metrics</h1>
+          <p className="muted">
+            Model-route latency, success rate, and cost. Agent runs record samples automatically.
+            Prometheus scrape: <span className="mono">GET /metrics</span>
+          </p>
+        </div>
+        <button onClick={() => void load()}>Refresh</button>
+      </header>
+
+      {overview && (
+        <div className="metric-grid">
+          <div className="metric-card">
+            <div className="metric-label">Requests</div>
+            <div className="metric-value">{overview.requests}</div>
+            <div className="muted mono">window · {sampleCount} samples</div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">Success rate</div>
+            <div className="metric-value">{pct(overview.successRate)}</div>
+            <div className="muted mono">
+              {overview.successes} ok · {overview.failures} fail
+            </div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">Latency p50 / p95</div>
+            <div className="metric-value">
+              {overview.p50LatencyMs.toFixed(0)}
+              <span className="metric-unit">ms</span>
+            </div>
+            <div className="muted mono">p95 {overview.p95LatencyMs.toFixed(0)} ms</div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">Cost units</div>
+            <div className="metric-value">{overview.totalCostUnits.toFixed(3)}</div>
+            <div className="muted mono">approx token-derived</div>
+          </div>
+        </div>
+      )}
+
+      <div className="split" style={{ marginTop: "1.25rem" }}>
+        <div className="panel">
+          <div className="form-section-title">Routes</div>
+          {routes.length === 0 && (
+            <p className="muted">No samples yet — run a published agent to populate metrics.</p>
+          )}
+          {routes.map((r) => (
+            <button
+              key={r.routeName}
+              className={selected === r.routeName ? "list-item active" : "list-item"}
+              onClick={() => void openRoute(r.routeName)}
+            >
+              <strong>{r.routeName}</strong>
+              <span className="muted">
+                {r.requests} req · {pct(r.successRate)} · p95 {r.p95LatencyMs.toFixed(0)}ms
+              </span>
+            </button>
+          ))}
+          {selected && (
+            <div className="toolbar" style={{ marginTop: "0.75rem" }}>
+              <button className="primary" disabled={busy} onClick={() => void tuneSelected()}>
+                {busy ? "Tuning…" : "Auto-tune route weights"}
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="panel">
+          <div className="form-section-title">Candidates</div>
+          {candidates.map((c) => (
+            <div key={c.key} className="metric-bar-row">
+              <div className="metric-bar-meta">
+                <span className="mono">{c.key}</span>
+                <span className="muted">
+                  {pct(c.successRate)} · avg {c.avgLatencyMs.toFixed(0)}ms
+                </span>
+              </div>
+              <div className="metric-bar-track">
+                <div
+                  className="metric-bar-fill"
+                  style={{ width: `${Math.max(4, (c.requests / maxReq) * 100)}%` }}
+                />
+              </div>
+            </div>
+          ))}
+          {detail && <pre className="code" style={{ marginTop: "1rem" }}>{detail}</pre>}
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: "1.25rem" }}>
+        <div className="form-section-title">Recent samples</div>
+        <div className="table-like">
+          {samples.map((s, i) => (
+            <div key={`${s.recordedAt}-${i}`} className="table-row">
+              <span className="mono">{s.routeName}</span>
+              <span className="mono">
+                {s.provider}/{s.model}
+              </span>
+              <span className={s.success ? "badge ok" : "badge danger"}>
+                {s.success ? "ok" : "fail"}
+              </span>
+              <span>{s.latencyMs.toFixed(1)} ms</span>
+              <span className="muted mono">{s.recordedAt}</span>
+            </div>
+          ))}
+          {samples.length === 0 && <p className="muted">No recent samples.</p>}
+        </div>
       </div>
     </section>
   );

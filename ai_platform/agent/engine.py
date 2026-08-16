@@ -8,9 +8,11 @@ from ai_platform.core.models import (
     ExecutionEvent,
     MemoryProfileSpec,
     ModelRouteSpec,
+    ToolboxEntry,
     ToolSpec,
     ToolboxSpec,
 )
+from ai_platform.governor.engine import ToolGovernor
 from ai_platform.context.engineer import ContextBudget, ContextEngineer
 from ai_platform.guardrails.pipeline import GuardrailPipeline
 from ai_platform.knowledge.service import KnowledgeService
@@ -32,13 +34,22 @@ class AgentEngine:
         knowledge_service: KnowledgeService | None = None,
         guardrail_pipeline: GuardrailPipeline | None = None,
         context_engineer: ContextEngineer | None = None,
+        governor: ToolGovernor | None = None,
+        metrics_collector: Any | None = None,
     ) -> None:
-        self.model_router = model_router or ModelRouter(providers=build_default_providers())
+        self.model_router = model_router or ModelRouter(
+            providers=build_default_providers(),
+            metrics_collector=metrics_collector,
+        )
+        if metrics_collector is not None and getattr(self.model_router, "_metrics", None) is None:
+            self.model_router._metrics = metrics_collector
         self.tool_host = tool_host or SandboxedToolHost()
         self.memory_service = memory_service or MemoryService()
         self.knowledge_service = knowledge_service or KnowledgeService()
         self.guardrail_pipeline = guardrail_pipeline or GuardrailPipeline()
         self.context_engineer = context_engineer or ContextEngineer()
+        self.governor = governor or ToolGovernor(fail_closed=False)
+        self.metrics_collector = metrics_collector
 
     def _resolve(self, bundle: dict[str, dict], ref: str) -> dict[str, Any] | None:
         parts = ref.split("/", 1)
@@ -67,6 +78,8 @@ class AgentEngine:
         input_data: dict[str, Any],
         stream: bool = False,
         session_id: str | None = None,
+        org_id: str = "default",
+        namespace_id: str = "local",
     ) -> AsyncIterator[ExecutionEvent] | ExecutionEvent:
         execution_id = new_id("exec")
         agent_doc = self._resolve(bundle_resources, agent_ref)
@@ -138,7 +151,7 @@ class AgentEngine:
             )
         )
 
-        tools_available: list[ToolSpec] = []
+        bound_tools: list[tuple[ToolboxEntry, ToolSpec]] = []
         if spec.toolbox_ref:
             toolbox_doc = self._resolve(bundle_resources, spec.toolbox_ref)
             if toolbox_doc:
@@ -146,7 +159,9 @@ class AgentEngine:
                 for entry in toolbox.tools:
                     tool_doc = self._resolve(bundle_resources, entry.ref)
                     if tool_doc:
-                        tools_available.append(ToolSpec.model_validate(tool_doc["spec"]))
+                        bound_tools.append(
+                            (entry, ToolSpec.model_validate(tool_doc["spec"]))
+                        )
 
         async def _stream() -> AsyncIterator[ExecutionEvent]:
             if alerts:
@@ -156,8 +171,29 @@ class AgentEngine:
                     execution_id=execution_id,
                 )
 
-            if tools_available and input_data.get("use_tool"):
-                tool_spec = tools_available[0]
+            if bound_tools and input_data.get("use_tool"):
+                entry, tool_spec = bound_tools[0]
+                quota = entry.rate_limit or tool_spec.rate_limit
+                if not input_data.get("governor_override"):
+                    decision = await self.governor.check(
+                        tool_ref=entry.ref,
+                        rate_limit=quota,
+                        org_id=org_id,
+                        namespace_id=namespace_id,
+                    )
+                    if not decision.allowed:
+                        payload = self.governor.approval_payload(
+                            decision,
+                            tool_name=tool_spec.manifest.name,
+                            tool_ref=entry.ref,
+                        )
+                        payload["agentRef"] = agent_ref
+                        yield ExecutionEvent(
+                            type="approval_required",
+                            data=payload,
+                            execution_id=execution_id,
+                        )
+                        return
                 yield ExecutionEvent(
                     type="tool_call",
                     data={"tool": tool_spec.manifest.name, "input": input_data},
@@ -171,7 +207,10 @@ class AgentEngine:
                 )
 
             response = await self.model_router.complete(
-                route_spec, ModelRequest(messages=messages)
+                route_spec,
+                ModelRequest(messages=messages),
+                route_name=spec.model_ref,
+                namespace_id=namespace_id,
             )
             output_text, out_alerts = await self.guardrail_pipeline.run_output(
                 response.content, guardrail_specs

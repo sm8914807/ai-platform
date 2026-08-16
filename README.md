@@ -28,14 +28,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 platform-api
-# → http://localhost:8080
+# → http://localhost:8080  (JWT required by default; Studio signs in via /v1/auth/login
+#    or OIDC when PLATFORM_OIDC_ISSUER + PLATFORM_OIDC_CLIENT_ID are set)
 
 # Seed demo catalog (optional; stop the API first for offline seed)
 python scripts/seed_offline.py
 
 # Console
 cd console && npm install && npm run dev
-# → http://localhost:5173
+# → http://localhost:5173  (sign in with any email; user is created on first login)
 ```
 
 Or use the helper:
@@ -65,7 +66,10 @@ docker compose -f deploy/docker/docker-compose.yml up --build
 | **Federation (AMTP)** | Cross-domain agent messaging |
 | **Deploy** | Docker Compose + Helm |
 
-See [Architecture](docs/architecture.md) for how the pieces connect.
+**Docs**
+
+- [Complete product + technical guide (LLD)](docs/COMPLETE_GUIDE.md) — full walkthrough: how folders connect, every feature + use case, request flows, maturity matrix
+- [Architecture overview](docs/architecture.md) — short diagram
 
 ---
 
@@ -97,6 +101,17 @@ CLI:
 ```bash
 platform run agents/support-agent --input '{"message":"hello"}'
 pytest
+```
+
+**CI** (`.github/workflows/ci.yml`): unit tests, Postgres service job (`PLATFORM_TEST_DATABASE_URL`), console build, Playwright Studio e2e.
+
+```bash
+# Local Postgres tests (optional)
+export PLATFORM_TEST_DATABASE_URL=postgresql://platform:platform@localhost:5432/ai_platform
+pytest -q tests/test_postgres_ci.py
+
+# Console e2e (API on :8080 required)
+cd console && npx playwright install chromium && npm run e2e
 ```
 
 ---

@@ -90,6 +90,8 @@ class Orchestrator:
                         request.resource_ref,
                         request.input,
                         session_id=request.session_id,
+                        org_id=org_id,
+                        namespace_id=namespace_id,
                     )
                     event = ExecutionEvent(
                         type="done",
@@ -113,6 +115,8 @@ class Orchestrator:
                     request.input,
                     stream=request.stream,
                     session_id=request.session_id,
+                    org_id=org_id,
+                    namespace_id=namespace_id,
                 )
                 if request.stream:
                     async def _wrap():

@@ -3,6 +3,7 @@
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import yaml
@@ -39,6 +40,33 @@ class GitSyncService:
         await conn.close()
         return repo_id
 
+    async def list_repos(self, namespace_id: str) -> list[dict[str, Any]]:
+        conn = await aiosqlite.connect(self.db_path)
+        conn.row_factory = aiosqlite.Row
+        try:
+            rows = await conn.execute_fetchall(
+                "SELECT id, namespace_id, repo_path, branch, last_sync_at, last_commit, status, created_at "
+                "FROM git_sync_repos WHERE namespace_id = ? ORDER BY created_at DESC",
+                (namespace_id,),
+            )
+        except Exception:
+            await conn.close()
+            return []
+        await conn.close()
+        return [
+            {
+                "id": row["id"],
+                "namespaceId": row["namespace_id"],
+                "repoPath": row["repo_path"],
+                "branch": row["branch"],
+                "lastSyncAt": row["last_sync_at"],
+                "lastCommit": row["last_commit"],
+                "status": row["status"] or "unknown",
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
     async def sync_from_directory(
         self,
         namespace_id: str,
@@ -47,6 +75,14 @@ class GitSyncService:
         publish: bool = True,
         author: str | None = None,
     ) -> GitSyncResult:
+        if not directory.exists() or not directory.is_dir():
+            return GitSyncResult(
+                repo_id="",
+                applied=0,
+                skipped=0,
+                errors=[f"directory not found: {directory}"],
+                commit=None,
+            )
         repo_id = await self.register_repo(namespace_id, str(directory))
         applied = 0
         skipped = 0
@@ -122,5 +158,7 @@ class GitSyncService:
     def _dir_fingerprint(self, directory: Path) -> str:
         h = hashlib.sha256()
         for path in sorted(directory.rglob("*.yaml")):
+            h.update(path.read_bytes())
+        for path in sorted(directory.rglob("*.yml")):
             h.update(path.read_bytes())
         return h.hexdigest()[:16]

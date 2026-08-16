@@ -11,13 +11,24 @@ spec:
         message: billing invoice help
       expected:
         contains: billing
+    - id: case-2
+      input:
+        message: reset my password
+      expected:
+        contains: password
   evaluators:
+    - type: keyword_match
     - type: llm_judge
+      criteria: quality
+      metric: quality
+    - type: faithfulness
     - type: latency
       maxP95Ms: 5000
-    - type: keyword_match
   triggers:
     - onPublish: [agents/support-agent]
   gates:
-    failIf: score < 0.5
     minScore: 0.5
+    failIf: score < 0.5
+    metrics:
+      quality: 0.5
+      keyword: 0.5

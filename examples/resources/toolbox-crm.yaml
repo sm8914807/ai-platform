@@ -8,3 +8,4 @@ spec:
   tools:
     - ref: tools/get-customer
       permissions: [read:customer]
+      rateLimit: 20/min

@@ -101,6 +101,16 @@ class RegistryStore(ABC):
         ...
 
     @abstractmethod
+    async def unpublish(
+        self, namespace_id: str, kind: ResourceKind, name: str
+    ) -> None:
+        """Clear the published pointer (draft versions remain)."""
+
+    @abstractmethod
+    async def list_namespaces(self) -> list[dict[str, Any]]:
+        """Return ``[{id, path, env}, ...]`` known to the registry."""
+
+    @abstractmethod
     async def set_bundle_hash(
         self, resource_version_id: str, bundle_hash: str
     ) -> None:

@@ -123,22 +123,19 @@ async def test_git_sync_apply_export(tmp_path):
     export_dir = tmp_path / "export"
     count = await git.export_to_directory(ns, "org/project", export_dir)
     assert count >= 1
+    repos = await git.list_repos(ns)
+    assert len(repos) >= 1
+    assert repos[0]["repoPath"] == str(resources_dir)
+    assert repos[0]["status"] in {"synced", "partial"}
 
 
 @pytest.mark.asyncio
-async def test_sso_and_scim():
-    import tempfile
+async def test_sso_and_scim(tmp_path):
+    from ai_platform.db.sql import create_sql_backend, migrate_aux_stores
 
-    db = tempfile.mktemp(suffix=".db")
-    store = IdentityStore(db)
-    # create tables manually for in-memory - use migrate via registry pattern
-    import aiosqlite
-
-    conn = await aiosqlite.connect(db)
-    migration = Path(__file__).parent.parent / "migrations" / "003_phase3.sql"
-    await conn.executescript(migration.read_text())
-    await conn.commit()
-    await conn.close()
+    sql = create_sql_backend(db_path=str(tmp_path / "id.db"))
+    await migrate_aux_stores(sql)
+    store = IdentityStore(sql=sql)
 
     sso = SsoService(store, OidcValidator("test-secret"))
     login = await sso.login("default-org", "user@example.com", "User")
@@ -152,11 +149,14 @@ async def test_sso_and_scim():
         ScimUserPayload(userName="scim@example.com", name={"formatted": "SCIM User"}),
     )
     assert created["userName"] == "scim@example.com"
+    await sql.close()
 
 
 def test_terraform_export(tmp_path):
     from ai_platform.registry.store import ResourceVersionRecord
     from datetime import datetime, timezone
+
+    from ai_platform.terraform.export import build_terraform_files
 
     published = [
         ResourceVersionRecord(
@@ -181,3 +181,7 @@ def test_terraform_export(tmp_path):
     # Terraform resource addresses use underscores, not hyphens
     assert "export_prompt" in json_out
     assert "platform_prompt" in json_out
+    preview = build_terraform_files(published, "org/project")
+    assert "provider.tf" in preview
+    assert "platform_prompt_export_prompt.tf" in preview
+    assert "exported.json" in preview

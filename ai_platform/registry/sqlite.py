@@ -239,6 +239,29 @@ class SqliteRegistryStore(RegistryStore):
         await conn.commit()
         await conn.close()
 
+    async def unpublish(
+        self, namespace_id: str, kind: ResourceKind, name: str
+    ) -> None:
+        resource = await self.get_resource(namespace_id, kind, name)
+        if not resource:
+            raise ValueError(f"Resource not found: {kind.value}/{name}")
+        conn = await self._connect()
+        now = datetime.now(timezone.utc).isoformat()
+        await conn.execute(
+            "UPDATE resources SET published_version = NULL, updated_at = ? WHERE id = ?",
+            (now, resource.id),
+        )
+        await conn.commit()
+        await conn.close()
+
+    async def list_namespaces(self) -> list[dict[str, Any]]:
+        conn = await self._connect()
+        rows = await conn.execute_fetchall(
+            "SELECT id, path, env FROM namespaces ORDER BY path, env"
+        )
+        await conn.close()
+        return [{"id": r[0], "path": r[1], "env": r[2]} for r in rows]
+
     async def set_bundle_hash(self, resource_version_id: str, bundle_hash: str) -> None:
         conn = await self._connect()
         await conn.execute(

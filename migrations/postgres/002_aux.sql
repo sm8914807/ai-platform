@@ -242,6 +242,39 @@ CREATE TABLE IF NOT EXISTS secrets (
   UNIQUE(namespace_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS memory_entries (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  layer TEXT NOT NULL,
+  content_json JSONB NOT NULL DEFAULT '{}',
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS memory_snapshots (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  entries_json JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  source_name TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  embedding_json JSONB,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(scope, layer);
+CREATE INDEX IF NOT EXISTS idx_knowledge_source ON knowledge_chunks(source_name);
+
 CREATE TABLE IF NOT EXISTS amtp_schemas (
   id TEXT PRIMARY KEY,
   schema_id TEXT NOT NULL UNIQUE,

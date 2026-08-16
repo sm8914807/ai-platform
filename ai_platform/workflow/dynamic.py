@@ -1,8 +1,9 @@
-"""Dynamic workflow mode — AI planner generates IR at runtime, then executes."""
+"""Dynamic workflow mode — LLM planner generates IR at runtime, then executes."""
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -11,11 +12,37 @@ from pydantic import BaseModel, Field
 
 from ai_platform.agent.engine import AgentEngine
 from ai_platform.core.ids import new_id
-from ai_platform.core.models import WorkflowSpec, WorkflowStep
+from ai_platform.core.models import ModelRouteSpec, WorkflowSpec, WorkflowStep
 from ai_platform.db.sql import SqlBackend, create_sql_backend
+from ai_platform.model_router.router import ModelRequest, ModelRouter
 from ai_platform.workflow.engine import WorkflowEngine
 
 MIGRATION = Path(__file__).parent.parent.parent / "migrations" / "005_differentiators.sql"
+
+PLANNER_SYSTEM = """You are a workflow planner for an enterprise AI platform.
+Given a user goal and available agents/tools, output ONLY valid JSON (no markdown)
+matching this schema:
+{
+  "name": "short-kebab-name",
+  "description": "one sentence",
+  "steps": [
+    {
+      "id": "step-id",
+      "type": "agent" | "tool" | "parallel" | "humanApproval",
+      "ref": "agents/name or tools/name or approval-flows/name",
+      "when": null or "$.steps.approve.status == approved",
+      "description": "what this step does",
+      "capabilities": ["optional"],
+      "branches": [{"id":"...", "type":"agent", "ref":"agents/..."}]
+    }
+  ]
+}
+Rules:
+- Prefer available_agents / available_tools refs exactly when possible.
+- Use humanApproval when the goal implies approval, refund, onboard, provision, or high risk.
+- Use parallel only when independent research/compare slices help; put child steps in branches.
+- Keep 1–6 steps. Never invent tool refs that are not listed unless type is humanApproval.
+- Output JSON only."""
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -26,6 +53,31 @@ def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         return json.loads(value) if value else {}
     return dict(value)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Parse a JSON object from model output (raw or fenced)."""
+    raw = text.strip()
+    if not raw:
+        return None
+    # Strip markdown fences if present
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if fence:
+        raw = fence.group(1).strip()
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(raw[start : end + 1])
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 class DynamicStepIR(BaseModel):
@@ -45,6 +97,11 @@ class DynamicWorkflowIR(BaseModel):
     description: str | None = None
     steps: list[DynamicStepIR]
     source: Literal["planner", "user", "template"] = "planner"
+    planner_backend: Literal["llm", "heuristic"] | None = Field(
+        default=None, alias="plannerBackend"
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class PlanRequest(BaseModel):
@@ -52,6 +109,12 @@ class PlanRequest(BaseModel):
     constraints: dict[str, Any] = Field(default_factory=dict)
     available_agents: list[str] = Field(default_factory=list)
     available_tools: list[str] = Field(default_factory=list)
+    planner_mode: Literal["auto", "llm", "heuristic"] = Field(
+        default="auto", alias="plannerMode"
+    )
+    model_ref: str | None = Field(default=None, alias="modelRef")
+
+    model_config = {"populate_by_name": True}
 
 
 class DynamicWorkflowResult(BaseModel):
@@ -62,19 +125,17 @@ class DynamicWorkflowResult(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
 
 
-class DynamicWorkflowPlanner:
-    """Turns a natural-language goal into a DynamicWorkflowIR.
+class HeuristicWorkflowPlanner:
+    """Deterministic keyword planner (fallback + tests)."""
 
-    Phase 5 uses a deterministic heuristic planner. Swap for LLM planner via ModelRouter.
-    """
-
-    def plan(self, request: PlanRequest, discovery_hits: list[str] | None = None) -> DynamicWorkflowIR:
+    def plan(
+        self, request: PlanRequest, discovery_hits: list[str] | None = None
+    ) -> DynamicWorkflowIR:
         goal = request.goal.lower()
         steps: list[DynamicStepIR] = []
         agents = request.available_agents or (discovery_hits or ["agents/support-agent"])
         tools = request.available_tools
 
-        # Heuristic: research → synthesize → optional approval
         if any(k in goal for k in ("research", "analyze", "compare", "market")):
             for i, agent in enumerate(agents[:3]):
                 steps.append(
@@ -93,8 +154,7 @@ class DynamicWorkflowPlanner:
                         type="parallel",
                         description="Parallel research",
                         branches=[
-                            {"id": s.id, "type": s.type, "ref": s.ref}
-                            for s in steps
+                            {"id": s.id, "type": s.type, "ref": s.ref} for s in steps
                         ],
                     )
                 ]
@@ -107,7 +167,7 @@ class DynamicWorkflowPlanner:
                     capabilities=["synthesis"],
                 )
             )
-        elif any(k in goal for k in ("approve", "onboard", "provision")):
+        elif any(k in goal for k in ("approve", "onboard", "provision", "refund")):
             steps.append(
                 DynamicStepIR(
                     id="enrich",
@@ -134,7 +194,6 @@ class DynamicWorkflowPlanner:
                 )
             )
         else:
-            # Default: single agent + optional tool
             steps.append(
                 DynamicStepIR(
                     id="execute",
@@ -158,7 +217,181 @@ class DynamicWorkflowPlanner:
             description=request.goal,
             steps=steps,
             source="planner",
+            planner_backend="heuristic",
         )
+
+
+class DynamicWorkflowPlanner:
+    """Turns a natural-language goal into a DynamicWorkflowIR.
+
+    Prefers an LLM plan via ModelRouter; falls back to HeuristicWorkflowPlanner.
+    """
+
+    def __init__(
+        self,
+        model_router: ModelRouter | None = None,
+        *,
+        default_route: ModelRouteSpec | None = None,
+        default_mode: Literal["auto", "llm", "heuristic"] = "auto",
+    ) -> None:
+        self.model_router = model_router
+        self.default_route = default_route or ModelRouteSpec(
+            candidates=[{"provider": "mock", "model": "mock-planner", "weight": 100}]
+        )
+        self.default_mode = default_mode
+        self.heuristic = HeuristicWorkflowPlanner()
+
+    def plan(
+        self, request: PlanRequest, discovery_hits: list[str] | None = None
+    ) -> DynamicWorkflowIR:
+        """Sync entry used by tests — heuristic only."""
+        return self.heuristic.plan(request, discovery_hits)
+
+    async def plan_async(
+        self,
+        request: PlanRequest,
+        discovery_hits: list[str] | None = None,
+        *,
+        route_spec: ModelRouteSpec | None = None,
+        namespace_id: str | None = None,
+    ) -> DynamicWorkflowIR:
+        mode = request.planner_mode or self.default_mode
+        if mode == "heuristic" or (mode == "auto" and self.model_router is None):
+            return self.heuristic.plan(request, discovery_hits)
+        if mode == "llm" and self.model_router is None:
+            return self.heuristic.plan(request, discovery_hits)
+
+        try:
+            ir = await self._plan_with_llm(
+                request,
+                discovery_hits,
+                route_spec=route_spec or self.default_route,
+                namespace_id=namespace_id,
+            )
+            if ir is not None:
+                return ir
+        except Exception:
+            pass
+        fallback = self.heuristic.plan(request, discovery_hits)
+        fallback.planner_backend = "heuristic"
+        return fallback
+
+    async def _plan_with_llm(
+        self,
+        request: PlanRequest,
+        discovery_hits: list[str] | None,
+        *,
+        route_spec: ModelRouteSpec,
+        namespace_id: str | None,
+    ) -> DynamicWorkflowIR | None:
+        assert self.model_router is not None
+        agents = request.available_agents or (discovery_hits or ["agents/support-agent"])
+        tools = request.available_tools
+        user_payload = {
+            "goal": request.goal,
+            "constraints": request.constraints,
+            "available_agents": agents,
+            "available_tools": tools,
+        }
+        response = await self.model_router.complete(
+            route_spec,
+            ModelRequest(
+                messages=[
+                    {"role": "system", "content": PLANNER_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Plan a workflow for this request as JSON:\n"
+                            + json.dumps(user_payload, indent=2)
+                        ),
+                    },
+                ],
+                temperature=0.2,
+            ),
+            route_name=request.model_ref or "models/planner",
+            namespace_id=namespace_id,
+        )
+        # Prefer LLM JSON; mock planner returns structured JSON for offline runs.
+        data = _extract_json_object(response.content)
+        if not data:
+            return None
+        return self._normalize_ir(data, request, agents, tools)
+
+    def _normalize_ir(
+        self,
+        data: dict[str, Any],
+        request: PlanRequest,
+        agents: list[str],
+        tools: list[str],
+    ) -> DynamicWorkflowIR:
+        allowed_agents = set(agents)
+        allowed_tools = set(tools)
+        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        steps: list[DynamicStepIR] = []
+        for i, raw in enumerate(raw_steps[:8]):
+            if not isinstance(raw, dict):
+                continue
+            step_type = str(raw.get("type") or "agent")
+            if step_type not in {"agent", "tool", "parallel", "humanApproval", "condition"}:
+                step_type = "agent"
+            ref = raw.get("ref")
+            if isinstance(ref, str):
+                ref = self._normalize_ref(ref, step_type)
+                if step_type == "agent" and allowed_agents and ref not in allowed_agents:
+                    # Map unknown agent refs onto the first available agent.
+                    ref = agents[0]
+                if step_type == "tool" and allowed_tools and ref not in allowed_tools:
+                    ref = tools[0] if tools else ref
+            elif step_type == "agent":
+                ref = agents[0]
+            step_id = str(raw.get("id") or f"step-{i+1}")
+            branches = raw.get("branches") if isinstance(raw.get("branches"), list) else []
+            clean_branches: list[dict[str, Any]] = []
+            for b in branches:
+                if not isinstance(b, dict):
+                    continue
+                b_ref = b.get("ref")
+                if isinstance(b_ref, str):
+                    b_ref = self._normalize_ref(b_ref, str(b.get("type") or "agent"))
+                clean_branches.append(
+                    {
+                        "id": b.get("id") or f"{step_id}-b",
+                        "type": b.get("type") or "agent",
+                        "ref": b_ref,
+                    }
+                )
+            steps.append(
+                DynamicStepIR(
+                    id=step_id,
+                    type=step_type,  # type: ignore[arg-type]
+                    ref=ref,
+                    when=raw.get("when"),
+                    description=raw.get("description") or request.goal,
+                    capabilities=list(raw.get("capabilities") or []),
+                    branches=clean_branches,
+                )
+            )
+        if not steps:
+            raise ValueError("LLM planner returned no steps")
+        name = str(data.get("name") or f"dyn-{new_id('plan')[:8]}")
+        name = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-")[:64] or f"dyn-{new_id('plan')[:8]}"
+        return DynamicWorkflowIR(
+            name=name,
+            description=str(data.get("description") or request.goal),
+            steps=steps,
+            source="planner",
+            planner_backend="llm",
+        )
+
+    def _normalize_ref(self, ref: str, step_type: str) -> str:
+        ref = ref.strip()
+        if "/" in ref:
+            return ref
+        if step_type == "tool":
+            return f"tools/{ref}"
+        if step_type == "humanApproval":
+            return f"approval-flows/{ref}"
+        return f"agents/{ref}"
 
     def ir_to_workflow_spec(self, ir: DynamicWorkflowIR) -> WorkflowSpec:
         steps: list[WorkflowStep] = []
@@ -186,6 +419,8 @@ class DynamicWorkflowEngine:
         workflow_engine: WorkflowEngine | None = None,
         planner: DynamicWorkflowPlanner | None = None,
         sql: SqlBackend | None = None,
+        model_router: ModelRouter | None = None,
+        planner_mode: Literal["auto", "llm", "heuristic"] = "auto",
     ) -> None:
         self.sql = sql or create_sql_backend(db_path=db_path or ".platform/registry.db")
         self.db_path = db_path or getattr(self.sql, "db_path", ".platform/registry.db")
@@ -193,12 +428,31 @@ class DynamicWorkflowEngine:
         self.workflow_engine = workflow_engine or WorkflowEngine(
             agent_engine=self.agent_engine, db_path=self.db_path, sql=self.sql
         )
-        self.planner = planner or DynamicWorkflowPlanner()
+        router = model_router or getattr(self.agent_engine, "model_router", None)
+        self.planner = planner or DynamicWorkflowPlanner(
+            model_router=router, default_mode=planner_mode
+        )
 
     async def migrate(self) -> None:
-        # no-op or sqlite-only script; centralized migrate_aux_stores handles full migrate
         if self.sql.kind == "sqlite" and MIGRATION.exists():
             await self.sql.migrate_script(MIGRATION.read_text())
+
+    def _route_from_bundle(
+        self, bundle: dict[str, dict], model_ref: str | None
+    ) -> ModelRouteSpec | None:
+        ref = model_ref or "models/gpt-4o-routed"
+        parts = ref.split("/", 1)
+        name = parts[1] if len(parts) == 2 else parts[0]
+        doc = bundle.get(f"ModelRoute:{name}")
+        if not doc:
+            # Any published model route
+            for key, value in bundle.items():
+                if key.startswith("ModelRoute:"):
+                    doc = value
+                    break
+        if not doc:
+            return None
+        return ModelRouteSpec.model_validate(doc["spec"])
 
     async def plan_and_run(
         self,
@@ -208,7 +462,13 @@ class DynamicWorkflowEngine:
         bundle: dict[str, dict],
         discovery_hits: list[str] | None = None,
     ) -> DynamicWorkflowResult:
-        ir = self.planner.plan(request, discovery_hits)
+        route_spec = self._route_from_bundle(bundle, request.model_ref)
+        ir = await self.planner.plan_async(
+            request,
+            discovery_hits,
+            route_spec=route_spec,
+            namespace_id=namespace_id,
+        )
         return await self.run_ir(
             namespace_id, org_id, ir, {"goal": request.goal, **request.constraints}, bundle
         )
@@ -224,7 +484,6 @@ class DynamicWorkflowEngine:
         workflow_id = new_id("dynwf")
         now = datetime.now(timezone.utc)
 
-        # Inject ephemeral Workflow resource into bundle for WorkflowEngine
         ephemeral_name = ir.name
         bundle = dict(bundle)
         spec = self.planner.ir_to_workflow_spec(ir)
@@ -243,8 +502,13 @@ class DynamicWorkflowEngine:
             "VALUES (?, ?, ?, ?, 'running', ?, ?)",
             workflow_id,
             namespace_id,
-            json.dumps({"goal": input_data.get("goal")}),
-            json.dumps(ir.model_dump()),
+            json.dumps(
+                {
+                    "goal": input_data.get("goal"),
+                    "plannerBackend": ir.planner_backend,
+                }
+            ),
+            json.dumps(ir.model_dump(by_alias=True)),
             json.dumps(input_data),
             now.isoformat(),
         )

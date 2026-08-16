@@ -1,9 +1,14 @@
-"""Tool host — MCP and OpenAPI adapters."""
+"""Tool host — REST / OpenAPI / MCP adapters."""
 
+from __future__ import annotations
+
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 from ai_platform.core.models import ToolSpec
+from ai_platform.tool_host.mcp.client import McpClient, build_transport_from_config
+from ai_platform.tool_host.mcp.transports import McpTransportError
 
 
 class ToolResult:
@@ -19,15 +24,12 @@ class ToolAdapter(ABC):
 
 
 class RestToolAdapter(ToolAdapter):
-    """REST tool — config.url + method."""
+    """REST tool — config.url + method (offline mock when no live URL)."""
 
     async def invoke(self, spec: ToolSpec, input_data: dict[str, Any]) -> ToolResult:
-        import time
-
         start = time.perf_counter()
         url = spec.config.get("url", "")
         method = spec.config.get("method", "GET").upper()
-        # Phase 1: echo mock for offline dev
         output = {
             "adapter": "rest",
             "method": method,
@@ -39,11 +41,9 @@ class RestToolAdapter(ToolAdapter):
 
 
 class OpenAPIToolAdapter(ToolAdapter):
-    """OpenAPI-defined REST tool."""
+    """OpenAPI-defined REST tool (offline mock)."""
 
     async def invoke(self, spec: ToolSpec, input_data: dict[str, Any]) -> ToolResult:
-        import time
-
         start = time.perf_counter()
         operation_id = spec.config.get("operationId", spec.manifest.name)
         base_url = spec.config.get("baseUrl", "")
@@ -57,23 +57,93 @@ class OpenAPIToolAdapter(ToolAdapter):
         return ToolResult(output, (time.perf_counter() - start) * 1000)
 
 
+def _mcp_should_mock(config: dict[str, Any]) -> bool:
+    if config.get("mock") or config.get("dryRun"):
+        return True
+    transport = str(config.get("transport") or "").lower()
+    if transport in {"http", "streamable-http", "sse", "https"}:
+        return not bool(config.get("url") or config.get("endpoint"))
+    if transport in {"stdio", "subprocess", "local"}:
+        return not bool(config.get("command"))
+    # Legacy CRDs only set server= — keep mock for offline demos unless command/url present.
+    if config.get("command") or config.get("url") or config.get("endpoint"):
+        return False
+    return True
+
+
+def _truncate(value: Any, max_bytes: int) -> Any:
+    text = value if isinstance(value, str) else str(value)
+    encoded = text.encode()
+    if len(encoded) <= max_bytes:
+        return value if not isinstance(value, str) else text
+    return encoded[:max_bytes].decode(errors="replace") + "…[truncated]"
+
+
 class MCPToolAdapter(ToolAdapter):
-    """MCP tool adapter — Phase 1 mock; wire real MCP client in Phase 2."""
+    """Production MCP adapter — stdio or Streamable HTTP JSON-RPC."""
+
+    def __init__(self, *, timeout_seconds: float = 30.0, max_output_bytes: int = 256_000) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.max_output_bytes = max_output_bytes
 
     async def invoke(self, spec: ToolSpec, input_data: dict[str, Any]) -> ToolResult:
-        import time
-
         start = time.perf_counter()
-        server = spec.config.get("server", "local")
-        tool_name = spec.manifest.name
-        output = {
-            "adapter": "mcp",
-            "server": server,
-            "tool": tool_name,
-            "input": input_data,
-            "mock": True,
-        }
-        return ToolResult(output, (time.perf_counter() - start) * 1000)
+        payload = dict(input_data)
+        payload.pop("_namespace_id", None)
+        config = dict(spec.config)
+        server = config.get("server", "local")
+        tool_name = str(config.get("toolName") or config.get("tool") or spec.manifest.name)
+
+        if _mcp_should_mock(config):
+            output = {
+                "adapter": "mcp",
+                "server": server,
+                "tool": tool_name,
+                "input": payload,
+                "mock": True,
+            }
+            return ToolResult(output, (time.perf_counter() - start) * 1000)
+
+        transport = build_transport_from_config(config, timeout_seconds=self.timeout_seconds)
+        client = McpClient(
+            transport,
+            protocol_version=str(
+                config.get("protocolVersion") or config.get("protocol_version") or "2025-03-26"
+            ),
+        )
+        try:
+            result = await client.call_tool(tool_name, payload)
+            output: dict[str, Any] = {
+                "adapter": "mcp",
+                "server": server,
+                "tool": tool_name,
+                "transport": config.get("transport")
+                or ("http" if config.get("url") else "stdio"),
+                "isError": result.is_error,
+                "content": result.content,
+                "text": _truncate(result.text(), self.max_output_bytes),
+                "mock": False,
+            }
+            if result.structured is not None:
+                output["structuredContent"] = result.structured
+            if result.is_error:
+                output["error"] = result.text()
+            return ToolResult(output, (time.perf_counter() - start) * 1000)
+        except McpTransportError as e:
+            return ToolResult(
+                {
+                    "adapter": "mcp",
+                    "server": server,
+                    "tool": tool_name,
+                    "mock": False,
+                    "isError": True,
+                    "error": str(e),
+                    "code": e.code,
+                },
+                (time.perf_counter() - start) * 1000,
+            )
+        finally:
+            await client.close()
 
 
 class ToolHost:

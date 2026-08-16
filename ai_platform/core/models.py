@@ -101,14 +101,19 @@ class ToolSpec(BaseModel):
     adapter: Literal["mcp", "openapi", "rest", "graphql", "grpc", "cli", "custom"]
     manifest: ToolManifest
     config: dict[str, Any] = Field(default_factory=dict)
-    auth_ref: str | None = None
+    auth_ref: str | None = Field(default=None, alias="authRef")
+    rate_limit: str | None = Field(default=None, alias="rateLimit")
+
+    model_config = {"populate_by_name": True}
 
 
 class ToolboxEntry(BaseModel):
     ref: str
     permissions: list[str] = Field(default_factory=list)
-    rate_limit: str | None = None
-    require_approval: bool = False
+    rate_limit: str | None = Field(default=None, alias="rateLimit")
+    require_approval: bool = Field(default=False, alias="requireApproval")
+
+    model_config = {"populate_by_name": True}
 
 
 class ToolboxSpec(BaseModel):
@@ -294,6 +299,9 @@ class WorkflowRunState(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] = Field(default_factory=dict)
     checkpoint_seq: int = 0
+    pending_approval: dict[str, Any] | None = Field(default=None, alias="pendingApproval")
+
+    model_config = {"populate_by_name": True}
 
 
 # --- Phase 3 models ---

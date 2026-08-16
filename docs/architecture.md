@@ -2,6 +2,8 @@
 
 How the platform fits together for product and platform teams.
 
+For the full LLD, folder map, feature use cases, and maturity matrix, see **[COMPLETE_GUIDE.md](COMPLETE_GUIDE.md)**.
+
 ```
 ┌─────────────┐     publish      ┌──────────────┐
 │  CRDs       │ ───────────────► │  Registry    │

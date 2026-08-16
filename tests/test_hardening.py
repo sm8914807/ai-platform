@@ -24,7 +24,7 @@ from ai_platform.tool_host.sandbox import SandboxPolicy, SandboxViolation, ToolS
 
 @pytest.fixture
 async def client(tmp_path: Path):
-    settings = Settings(db_path=str(tmp_path / "test.db"))
+    settings = Settings(db_path=str(tmp_path / "test.db"), auth_required=False)
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
@@ -155,7 +155,10 @@ async def test_api_secrets_and_federation(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.getenv("PLATFORM_TEST_DATABASE_URL"), reason="no Postgres DSN")
+@pytest.mark.skipif(
+    not (os.getenv("PLATFORM_TEST_DATABASE_URL") or os.getenv("PLATFORM_DATABASE_URL")),
+    reason="no Postgres DSN",
+)
 async def test_postgres_registry_optional():
     from ai_platform.registry.postgres import PostgresRegistryStore
     from ai_platform.core.models import (
@@ -164,14 +167,18 @@ async def test_postgres_registry_optional():
         ResourceMetadata,
     )
 
-    dsn = os.environ["PLATFORM_TEST_DATABASE_URL"]
+    dsn = os.environ.get("PLATFORM_TEST_DATABASE_URL") or os.environ["PLATFORM_DATABASE_URL"]
     store = PostgresRegistryStore(dsn)
     await store.migrate()
     ns = await store.ensure_namespace("acme/demo", "development")
     resource = PlatformResource(
         kind=ResourceKind.AGENT,
-        metadata=ResourceMetadata(name="hello", version="1.0.0"),
-        spec={"modelRef": "models/mock", "promptRef": "prompts/p"},
+        metadata=ResourceMetadata(
+            name="hello",
+            namespace="acme/demo",
+            version="1.0.0",
+        ),
+        spec={"role": "executor", "modelRef": "models/mock", "promptRef": "prompts/p"},
     )
     await store.upsert_resource_version(ns, resource)
     got = await store.get_resource(ns, ResourceKind.AGENT, "hello")

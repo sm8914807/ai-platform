@@ -22,8 +22,16 @@ class InMemoryRegistryStore(RegistryStore):
     async def ensure_namespace(self, namespace_path: str, env: str) -> str:
         key = f"{namespace_path}:{env}"
         if key not in self._namespaces:
-            self._namespaces[key] = new_id("ns")
+            self._namespaces[key] = f"mem:{namespace_path}:{env}"
         return self._namespaces[key]
+
+    async def list_namespaces(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for key, ns_id in self._namespaces.items():
+            path, _, env = key.rpartition(":")
+            out.append({"id": ns_id, "path": path, "env": env})
+        out.sort(key=lambda r: (r["path"], r["env"]))
+        return out
 
     async def upsert_resource_version(
         self,
@@ -109,6 +117,15 @@ class InMemoryRegistryStore(RegistryStore):
         if f"{resource.id}:{version}" not in self._versions:
             raise ValueError(f"Version not found: {version}")
         resource.published_version = version
+        resource.updated_at = datetime.now(timezone.utc)
+
+    async def unpublish(
+        self, namespace_id: str, kind: ResourceKind, name: str
+    ) -> None:
+        resource = await self.get_resource(namespace_id, kind, name)
+        if not resource:
+            raise ValueError(f"Resource not found: {kind.value}/{name}")
+        resource.published_version = None
         resource.updated_at = datetime.now(timezone.utc)
 
     async def set_bundle_hash(self, resource_version_id: str, bundle_hash: str) -> None:

@@ -161,3 +161,36 @@ class RegionService:
         await self.sql.execute(
             "UPDATE edge_runtimes SET last_telemetry_at = ? WHERE id = ?", now, node_id
         )
+
+    async def list_edge_nodes(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = await self.sql.fetchall(
+            "SELECT e.*, r.name AS region_name FROM edge_runtimes e "
+            "LEFT JOIN regions r ON r.id = e.region_id "
+            "ORDER BY e.created_at DESC LIMIT ?",
+            max(1, min(limit, 500)),
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            meta = row.get("metadata_json") or "{}"
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta) if meta else {}
+                except json.JSONDecodeError:
+                    meta = {}
+            out.append(
+                {
+                    "id": row["id"],
+                    "namespaceId": row["namespace_id"],
+                    "regionId": row.get("region_id"),
+                    "regionName": row.get("region_name"),
+                    "nodeType": row.get("node_type") or "edge",
+                    "bundleHash": row.get("bundle_hash"),
+                    "bundleCachePath": row.get("bundle_cache_path"),
+                    "lastSyncAt": row.get("last_sync_at"),
+                    "lastTelemetryAt": row.get("last_telemetry_at"),
+                    "status": row.get("status") or "online",
+                    "metadata": meta if isinstance(meta, dict) else {},
+                    "createdAt": row.get("created_at"),
+                }
+            )
+        return out

@@ -17,7 +17,12 @@ from ai_platform.discovery.service import (
     DiscoveryQuery,
     RegisterCapabilityRequest,
 )
-from ai_platform.workflow.dynamic import DynamicWorkflowEngine, DynamicWorkflowPlanner, PlanRequest
+from ai_platform.workflow.dynamic import (
+    DynamicWorkflowEngine,
+    DynamicWorkflowPlanner,
+    HeuristicWorkflowPlanner,
+    PlanRequest,
+)
 
 
 async def _migrate(db: str) -> None:
@@ -102,7 +107,7 @@ async def test_agent_discovery_routing():
 
 
 def test_dynamic_planner_research_goal():
-    planner = DynamicWorkflowPlanner()
+    planner = HeuristicWorkflowPlanner()
     ir = planner.plan(
         PlanRequest(
             goal="Research market data across competitors",
@@ -110,9 +115,30 @@ def test_dynamic_planner_research_goal():
         )
     )
     assert ir.source == "planner"
+    assert ir.planner_backend == "heuristic"
     assert any(s.type == "parallel" for s in ir.steps) or len(ir.steps) >= 2
-    spec = planner.ir_to_workflow_spec(ir)
+    facade = DynamicWorkflowPlanner()
+    spec = facade.ir_to_workflow_spec(ir)
     assert len(spec.steps) >= 1
+
+
+@pytest.mark.asyncio
+async def test_llm_planner_research_goal():
+    from ai_platform.model_router.providers import build_default_providers
+    from ai_platform.model_router.router import ModelRouter
+
+    router = ModelRouter(providers=build_default_providers())
+    planner = DynamicWorkflowPlanner(model_router=router, default_mode="llm")
+    ir = await planner.plan_async(
+        PlanRequest(
+            goal="Research market data across competitors",
+            available_agents=["agents/a", "agents/b", "agents/c"],
+            planner_mode="llm",
+        )
+    )
+    assert ir.planner_backend == "llm"
+    assert ir.name == "llm-research-plan"
+    assert any(s.type == "parallel" for s in ir.steps)
 
 
 @pytest.mark.asyncio

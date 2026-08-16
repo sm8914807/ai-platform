@@ -1,18 +1,49 @@
-"""Identity store for SSO and SCIM."""
+"""Identity store for SSO and SCIM (SQLite or Postgres via SqlBackend)."""
+
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
 from typing import Any
 
-import aiosqlite
-
 from ai_platform.core.ids import new_id
 from ai_platform.core.models import IdentityUser, ScimUserPayload
+from ai_platform.db.sql import SqlBackend, create_sql_backend
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return json.loads(value) if value else []
+    return list(value)
+
+
+def _row_user(r: dict[str, Any]) -> IdentityUser:
+    return IdentityUser(
+        id=r["id"],
+        org_id=r["org_id"],
+        email=r["email"],
+        display_name=r.get("display_name"),
+        external_id=r.get("external_id"),
+        teams=_as_list(r.get("teams_json")),
+        active=bool(r.get("active", True)),
+    )
 
 
 class IdentityStore:
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+    """Durable user/team store shared by SSO and SCIM."""
+
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        sql: SqlBackend | None = None,
+    ) -> None:
+        self.sql = sql or create_sql_backend(db_path=db_path or ".platform/registry.db")
+        self.db_path = db_path or getattr(self.sql, "db_path", ".platform/registry.db")
 
     async def create_user(
         self,
@@ -24,24 +55,20 @@ class IdentityStore:
     ) -> IdentityUser:
         user_id = new_id("user")
         now = datetime.now(timezone.utc).isoformat()
-        conn = await aiosqlite.connect(self.db_path)
-        await conn.execute(
+        await self.sql.execute(
             "INSERT INTO identity_users "
             "(id, org_id, email, display_name, external_id, teams_json, active, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
-            (
-                user_id,
-                org_id,
-                email,
-                display_name,
-                external_id,
-                json.dumps(teams or []),
-                now,
-                now,
-            ),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            user_id,
+            org_id,
+            email,
+            display_name,
+            external_id,
+            json.dumps(teams or []),
+            True,
+            now,
+            now,
         )
-        await conn.commit()
-        await conn.close()
         return IdentityUser(
             id=user_id,
             org_id=org_id,
@@ -52,66 +79,49 @@ class IdentityStore:
         )
 
     async def get_user_by_email(self, org_id: str, email: str) -> IdentityUser | None:
-        conn = await aiosqlite.connect(self.db_path)
-        conn.row_factory = aiosqlite.Row
-        rows = await conn.execute_fetchall(
-            "SELECT * FROM identity_users WHERE org_id = ? AND email = ?", (org_id, email)
+        row = await self.sql.fetchone(
+            "SELECT * FROM identity_users WHERE org_id = ? AND email = ?",
+            org_id,
+            email,
         )
-        await conn.close()
-        if not rows:
-            return None
-        r = rows[0]
-        return IdentityUser(
-            id=r["id"],
-            org_id=r["org_id"],
-            email=r["email"],
-            display_name=r["display_name"],
-            external_id=r["external_id"],
-            teams=json.loads(r["teams_json"]),
-            active=bool(r["active"]),
-        )
+        return _row_user(row) if row else None
 
     async def list_users(self, org_id: str) -> list[IdentityUser]:
-        conn = await aiosqlite.connect(self.db_path)
-        conn.row_factory = aiosqlite.Row
-        rows = await conn.execute_fetchall(
-            "SELECT * FROM identity_users WHERE org_id = ?", (org_id,)
+        rows = await self.sql.fetchall(
+            "SELECT * FROM identity_users WHERE org_id = ?",
+            org_id,
         )
-        await conn.close()
-        users = []
-        for r in rows:
-            users.append(
-                IdentityUser(
-                    id=r["id"],
-                    org_id=r["org_id"],
-                    email=r["email"],
-                    display_name=r["display_name"],
-                    external_id=r["external_id"],
-                    teams=json.loads(r["teams_json"]),
-                    active=bool(r["active"]),
-                )
-            )
-        return users
+        return [_row_user(r) for r in rows]
 
     async def deactivate_user(self, user_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        conn = await aiosqlite.connect(self.db_path)
-        await conn.execute(
-            "UPDATE identity_users SET active = 0, updated_at = ? WHERE id = ?", (now, user_id)
+        await self.sql.execute(
+            "UPDATE identity_users SET active = ?, updated_at = ? WHERE id = ?",
+            False,
+            now,
+            user_id,
         )
-        await conn.commit()
-        await conn.close()
 
     async def create_team(self, org_id: str, name: str) -> str:
         team_id = f"team:{name}"
         now = datetime.now(timezone.utc).isoformat()
-        conn = await aiosqlite.connect(self.db_path)
-        await conn.execute(
-            "INSERT OR IGNORE INTO identity_teams (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
-            (team_id, org_id, name, now),
-        )
-        await conn.commit()
-        await conn.close()
+        if self.sql.kind == "postgres":
+            await self.sql.execute(
+                "INSERT INTO identity_teams (id, org_id, name, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (id) DO NOTHING",
+                team_id,
+                org_id,
+                name,
+                now,
+            )
+        else:
+            await self.sql.execute(
+                "INSERT OR IGNORE INTO identity_teams (id, org_id, name, created_at) VALUES (?, ?, ?, ?)",
+                team_id,
+                org_id,
+                name,
+                now,
+            )
         return team_id
 
 

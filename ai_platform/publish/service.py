@@ -40,7 +40,18 @@ class PublishService:
         execute_fn: Any | None = None,
         eval_suite_ref: str | None = None,
     ) -> dict[str, Any]:
-        resource_ref = f"{kind.value}/{name}"
+        kind_slug = {
+            ResourceKind.AGENT: "agents",
+            ResourceKind.WORKFLOW: "workflows",
+            ResourceKind.PROMPT: "prompts",
+            ResourceKind.TOOL: "tools",
+            ResourceKind.TOOLBOX: "toolboxes",
+            ResourceKind.MODEL_ROUTE: "models",
+            ResourceKind.EVALUATION_SUITE: "evaluationsuites",
+            ResourceKind.POLICY: "policies",
+            ResourceKind.GUARDRAIL: "guardrails",
+        }.get(kind, kind.value.lower() + "s")
+        resource_ref = f"{kind_slug}/{name}"
 
         decision = self.policy_engine.evaluate(
             PolicyContext(
@@ -54,16 +65,46 @@ class PublishService:
         if not decision.allowed:
             raise PublishGateError("policy_denied", {"reason": decision.reason})
 
-        if bundle and eval_suite_ref:
-            suite = self.eval_runner.load_suite_from_bundle(bundle, eval_suite_ref)
-            if suite:
+        eval_summary: list[dict[str, Any]] = []
+        # Skip eval recursion when publishing the suite itself.
+        if bundle and kind != ResourceKind.EVALUATION_SUITE:
+            suites: list[tuple[str, Any]] = []
+            if eval_suite_ref:
+                suite = self.eval_runner.load_suite_from_bundle(bundle, eval_suite_ref)
+                if suite:
+                    suites.append((eval_suite_ref, suite))
+                else:
+                    raise PublishGateError(
+                        "evaluation_suite_missing",
+                        {"evalSuiteRef": eval_suite_ref},
+                    )
+            else:
+                suites = self.eval_runner.find_suites_for_target(bundle, resource_ref)
+
+            for suite_ref, suite in suites:
                 result = await self.eval_runner.run_suite(
                     suite, resource_ref, version, execute_fn
+                )
+                eval_summary.append(
+                    {
+                        "suiteRef": suite_ref,
+                        "runId": result.run_id,
+                        "passed": result.passed,
+                        "scores": result.scores,
+                        "overall": result.overall,
+                        "gateReason": result.gate_reason,
+                    }
                 )
                 if not result.passed:
                     raise PublishGateError(
                         "evaluation_failed",
-                        {"scores": result.scores, "details": result.details},
+                        {
+                            "suiteRef": suite_ref,
+                            "scores": result.scores,
+                            "overall": result.overall,
+                            "gateReason": result.gate_reason,
+                            "details": result.details,
+                        },
                     )
 
         await self.registry.publish(namespace_id, kind, name, version)
@@ -74,9 +115,14 @@ class PublishService:
             actor_id=principal,
             action="resource.published",
             resource_ref=resource_ref,
-            payload={"version": version, "gates": "passed"},
+            payload={"version": version, "gates": "passed", "evaluations": eval_summary},
             created_at=datetime.now(timezone.utc),
         )
         await self.registry.append_audit(audit)
 
-        return {"published": True, "version": version, "gates": "passed"}
+        return {
+            "published": True,
+            "version": version,
+            "gates": "passed",
+            "evaluations": eval_summary,
+        }

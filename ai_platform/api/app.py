@@ -101,6 +101,23 @@ class LoginBody(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class OidcStartBody(BaseModel):
+    code_challenge: str = Field(alias="codeChallenge")
+    org_id: str | None = Field(default=None, alias="orgId")
+    redirect_uri: str | None = Field(default=None, alias="redirectUri")
+
+    model_config = {"populate_by_name": True}
+
+
+class OidcCallbackBody(BaseModel):
+    code: str
+    state: str
+    code_verifier: str = Field(alias="codeVerifier")
+    org_id: str | None = Field(default=None, alias="orgId")
+
+    model_config = {"populate_by_name": True}
+
+
 class PublishPluginBody(BaseModel):
     name: str
     manifest: dict[str, Any]
@@ -114,10 +131,28 @@ class InstallPluginBody(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class NamespaceBody(BaseModel):
+    path: str
+    environment: str | None = None
+
+
+class UnpublishBody(BaseModel):
+    principal: str = "anonymous"
+
+
 class GitSyncBody(BaseModel):
     directory: str
     publish: bool = True
     author: str | None = None
+
+
+class GitExportBody(BaseModel):
+    directory: str = "./export"
+
+
+class TerraformExportBody(BaseModel):
+    directory: str = "./terraform"
+    write: bool = True
 
 
 class ScimUserBody(BaseModel):
@@ -129,10 +164,52 @@ class ScimUserBody(BaseModel):
     externalId: str | None = None
 
 
+class McpListBody(BaseModel):
+    tool_ref: str | None = Field(default=None, alias="toolRef")
+    config: dict[str, Any] | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class McpCallBody(BaseModel):
+    tool_ref: str | None = Field(default=None, alias="toolRef")
+    config: dict[str, Any] | None = None
+    tool_name: str | None = Field(default=None, alias="toolName")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
 def _auth_principal(request: Request, st: AppState) -> str:
     auth = request.headers.get("Authorization")
     ctx = st.sso_service.authenticate(auth)
-    return ctx.principal if ctx else "anonymous"
+    if ctx:
+        return ctx.principal
+    if st.auth_required:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return "anonymous"
+
+
+def _is_public_path(path: str) -> bool:
+    if path in {
+        "/health",
+        "/openapi.json",
+        "/docs",
+        "/redoc",
+        "/v1/auth/login",
+        "/v1/auth/config",
+        "/v1/auth/oidc/start",
+        "/v1/auth/oidc/callback",
+    }:
+        return True
+    if path.startswith("/docs") or path.startswith("/redoc"):
+        return True
+    if path.startswith("/.well-known/"):
+        return True
+    # AMTP discovery endpoints stay reachable without a Studio session.
+    if path in {"/v1/capabilities", "/v1/federation/info", "/v1/amtp/dns-txt", "/metrics"}:
+        return True
+    return False
 
 
 def _parse_resource(body: ResourceUpsertBody, namespace: str) -> PlatformResource:
@@ -186,6 +263,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         from ai_platform.db.sql import create_sql_backend, migrate_aux_stores
+        from ai_platform.telemetry.tracing import setup_tracing, shutdown_tracing
+
+        setup_tracing(
+            settings.otlp_service_name,
+            settings.otlp_endpoint,
+            environment=settings.default_env,
+            service_version="0.8.0",
+            console=settings.otlp_console,
+            memory=settings.otlp_memory,
+            force=True,
+        )
 
         sql = create_sql_backend(db_path=settings.db_path, database_url_override=dsn)
         await registry.migrate()
@@ -200,6 +288,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             backend=backend,
             sql=sql,
             database_url=dsn,
+            redis_url=settings.redis_url,
+            auth_secret=settings.auth_secret,
+            auth_required=settings.auth_required,
+            planner_mode=settings.planner_mode,
+            oidc_issuer=settings.oidc_issuer,
+            oidc_client_id=settings.oidc_client_id,
+            oidc_client_secret=settings.oidc_client_secret,
+            oidc_redirect_uri=settings.oidc_redirect_uri,
+            oidc_scopes=settings.oidc_scopes,
+            oidc_audience=settings.oidc_audience,
+            allow_dev_login=settings.allow_dev_login,
+            default_org_id=settings.default_namespace.split("/", 1)[0],
         )
         # Per-service migrate remains for sqlite unit paths / idempotent DDL
         await app.state.platform.workflow_engine.initialize()
@@ -210,22 +310,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await app.state.platform.message_bus.migrate()
         await app.state.platform.secrets.migrate()
         await app.state.platform.git_sync.migrate()
-        yield
-        await sql.close()
-        if backend == "postgres" and hasattr(registry, "close"):
-            await registry.close()
+        try:
+            yield
+        finally:
+            await sql.close()
+            if backend == "postgres" and hasattr(registry, "close"):
+                await registry.close()
+            shutdown_tracing()
 
     app = FastAPI(title="AI Platform Control Plane", version="0.8.0", lifespan=lifespan)
 
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
 
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins or ["http://localhost:5173"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def require_auth(request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if _is_public_path(request.url.path):
+            return await call_next(request)
+        st = getattr(request.app.state, "platform", None)
+        if st is None or not st.auth_required:
+            return await call_next(request)
+        ctx = st.sso_service.authenticate(request.headers.get("Authorization"))
+        if ctx is None:
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+        request.state.auth = ctx
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def otel_http(request: Request, call_next):
+        from ai_platform.telemetry.tracing import trace_http_middleware
+
+        return await trace_http_middleware(request, call_next)
 
     def state(request: Request) -> AppState:
         return request.app.state.platform
@@ -233,6 +359,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health(request: Request):
         st = getattr(request.app.state, "platform", None)
+        from ai_platform.telemetry.tracing import tracing_status
+
         return {
             "status": "ok",
             "version": "0.8.0",
@@ -240,6 +368,110 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "registryBackend": st.backend if st else backend,
             "sqlBackend": st.sql.kind if st else backend,
             "federationDomain": settings.federation_domain,
+            "tracing": tracing_status(),
+            "otlpEndpointConfigured": bool(settings.otlp_endpoint),
+        }
+
+    @app.get("/v1/namespaces")
+    async def list_namespaces(request: Request, environment: str | None = None):
+        st = state(request)
+        # Ensure the default workspace always appears in the switcher.
+        await st.registry.ensure_namespace(
+            settings.default_namespace, environment or settings.default_env
+        )
+        rows = await st.registry.list_namespaces()
+        if environment:
+            rows = [r for r in rows if r.get("env") == environment]
+        # Deduplicate by path (prefer default env when multiple).
+        by_path: dict[str, dict] = {}
+        for r in rows:
+            path = str(r.get("path") or "")
+            if path and path not in by_path:
+                by_path[path] = r
+            elif path and r.get("env") == (environment or settings.default_env):
+                by_path[path] = r
+        return {
+            "namespaces": list(by_path.values()),
+            "default": settings.default_namespace,
+            "environment": environment or settings.default_env,
+        }
+
+    @app.post("/v1/namespaces")
+    async def ensure_namespace_route(body: NamespaceBody, request: Request):
+        st = state(request)
+        path = body.path.strip().strip("/")
+        if "/" not in path:
+            raise HTTPException(400, detail="path must be org/project")
+        env = body.environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(path, env)
+        return {"id": ns_id, "path": path, "env": env}
+
+    @app.get("/metrics")
+    async def prometheus_metrics(request: Request, namespace: str | None = None):
+        """Prometheus scrape endpoint for model-route metrics."""
+        from fastapi.responses import PlainTextResponse
+
+        st = state(request)
+        ns_id = None
+        if namespace:
+            ns_id = await st.registry.ensure_namespace(namespace, settings.default_env)
+        text = await st.metrics_collector.prometheus_text(ns_id)
+        return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
+    @app.get("/v1/{namespace:path}/metrics/summary")
+    async def metrics_summary(
+        namespace: str,
+        request: Request,
+        environment: str | None = None,
+        window: int = 500,
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        return await st.metrics_collector.summarize_namespace(ns_id, window=window)
+
+    @app.get("/v1/{namespace:path}/metrics/routes")
+    async def metrics_routes(
+        namespace: str,
+        request: Request,
+        environment: str | None = None,
+        window: int = 500,
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        summary = await st.metrics_collector.summarize_namespace(ns_id, window=window)
+        return {"routes": summary["routes"], "overview": summary["overview"]}
+
+    @app.get("/v1/{namespace:path}/metrics/routes/{name}")
+    async def metrics_route_detail(
+        namespace: str,
+        name: str,
+        request: Request,
+        environment: str | None = None,
+        window: int = 200,
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        route_name = name if "/" in name else f"models/{name}"
+        return await st.metrics_collector.summarize_route(route_name, ns_id, window=window)
+
+    @app.get("/v1/{namespace:path}/metrics/recent")
+    async def metrics_recent(
+        namespace: str,
+        request: Request,
+        environment: str | None = None,
+        route: str | None = None,
+        limit: int = 50,
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        return {
+            "samples": await st.metrics_collector.recent(
+                ns_id, route_name=route, limit=limit
+            )
         }
 
     # --- Message Bus ---
@@ -650,6 +882,174 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, detail="No agent matched capabilities")
         return best.model_dump(mode="json")
 
+    async def _resolve_mcp_config(
+        st: AppState, namespace: str, env: str, tool_ref: str | None, config: dict | None
+    ) -> tuple[dict[str, Any], str | None]:
+        """Return (config, namespace_id) for MCP list/call."""
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        if config:
+            return dict(config), ns_id
+        if not tool_ref:
+            raise HTTPException(400, detail="toolRef or config is required")
+        parts = tool_ref.split("/", 1)
+        name = parts[1] if len(parts) == 2 else parts[0]
+        published = await st.registry.list_published(ns_id)
+        for v in published:
+            if v.kind == "Tool" and v.name == name:
+                cfg = dict(v.spec_json.get("config") or {})
+                if v.spec_json.get("authRef"):
+                    cfg.setdefault("authRef", v.spec_json["authRef"])
+                manifest = v.spec_json.get("manifest") or {}
+                cfg.setdefault("toolName", manifest.get("name") or name)
+                return cfg, ns_id
+        raise HTTPException(404, detail=f"Published tool not found: {tool_ref}")
+
+    @app.post("/v1/{namespace:path}/mcp/list")
+    async def mcp_list_tools(
+        namespace: str, body: McpListBody, request: Request, environment: str | None = None
+    ):
+        """Discover tools from an MCP server (stdio or HTTP)."""
+        from ai_platform.tool_host.mcp.client import McpClient, build_transport_from_config
+        from ai_platform.tool_host.mcp.transports import McpTransportError
+        from ai_platform.tool_host.sandbox import SandboxViolation
+
+        st = state(request)
+        env = environment or settings.default_env
+        config, ns_id = await _resolve_mcp_config(st, namespace, env, body.tool_ref, body.config)
+        config = await st.tool_sandbox.resolve_secrets(ns_id, config)
+        try:
+            if config.get("url") or str(config.get("transport", "")).lower() in {
+                "http",
+                "streamable-http",
+                "sse",
+                "https",
+            }:
+                st.tool_sandbox.check_url(str(config.get("url") or config.get("endpoint") or ""))
+            elif config.get("command"):
+                st.tool_sandbox.check_mcp_command(str(config["command"]))
+            transport = build_transport_from_config(
+                config, timeout_seconds=st.tool_sandbox.policy.timeout_seconds
+            )
+            client = McpClient(transport)
+            try:
+                tools = await client.list_tools()
+                return {
+                    "server": config.get("server"),
+                    "serverInfo": client.server_info,
+                    "tools": [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        }
+                        for t in tools
+                    ],
+                }
+            finally:
+                await client.close()
+        except (McpTransportError, SandboxViolation) as e:
+            raise HTTPException(400, detail=str(e)) from e
+
+    @app.post("/v1/{namespace:path}/mcp/call")
+    async def mcp_call_tool(
+        namespace: str, body: McpCallBody, request: Request, environment: str | None = None
+    ):
+        """Invoke one MCP tool (used by Studio probe / agent runtime)."""
+        from ai_platform.core.models import ToolManifest, ToolSpec
+        from ai_platform.tool_host.mcp.transports import McpTransportError
+        from ai_platform.tool_host.sandbox import SandboxViolation
+
+        st = state(request)
+        env = environment or settings.default_env
+        config, ns_id = await _resolve_mcp_config(st, namespace, env, body.tool_ref, body.config)
+        tool_name = body.tool_name or config.get("toolName") or config.get("tool") or "tool"
+        spec = ToolSpec(
+            adapter="mcp",
+            manifest=ToolManifest(name=str(tool_name), inputSchema={}, outputSchema={}),
+            config={**config, "toolName": tool_name},
+            auth_ref=config.get("authRef"),
+        )
+        try:
+            result = await st.tool_host.invoke(spec, body.arguments, namespace_id=ns_id)
+            return {"result": result.output, "latencyMs": result.latency_ms}
+        except (McpTransportError, SandboxViolation, ValueError) as e:
+            raise HTTPException(400, detail=str(e)) from e
+
+    @app.post("/v1/{namespace:path}/execute")
+    async def execute_resource(
+        namespace: str, body: dict, request: Request, environment: str | None = None
+    ):
+        """Run a published agent once (used by Studio's in-editor test runner)."""
+        from ai_platform.core.models import ExecutionRequest
+        from ai_platform.orchestrator.engine import Orchestrator
+        from ai_platform.telemetry.tracing import get_tracer
+
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        if not isinstance(body.get("resource_ref"), str) or not body["resource_ref"]:
+            raise HTTPException(400, detail="resource_ref is required")
+        if body.get("input") is not None and not isinstance(body["input"], dict):
+            raise HTTPException(400, detail="input must be an object")
+        execution = ExecutionRequest.model_validate(
+            {
+                "resource_ref": body.get("resource_ref"),
+                "input": body.get("input") or {},
+                "session_id": body.get("session_id"),
+                "trace_id": body.get("trace_id"),
+                "stream": False,
+            }
+        )
+        if not execution.resource_ref.startswith("agents/"):
+            raise HTTPException(400, detail="Studio test execution currently supports agents only")
+        published = await st.registry.list_published(ns_id)
+        bundle = _bundle_index(published)
+        orchestrator = Orchestrator(
+            agent_engine=st.agent_engine,
+            workflow_engine=st.workflow_engine,
+            policy_engine=st.policy_engine,
+        )
+        bundle_key = f"{ns_id}:{env}"
+        orchestrator.load_bundle(bundle_key, list(bundle.values()))
+        tracer = get_tracer("ai-platform.api")
+        with tracer.start_as_current_span("platform.execute") as span:
+            span.set_attribute("resource.ref", execution.resource_ref)
+            span.set_attribute("namespace", namespace)
+            span.set_attribute("environment", env)
+            span.set_attribute(
+                "multi_agent", bool(body.get("multiAgent") or body.get("multi_agent"))
+            )
+            result = await orchestrator.execute(
+                bundle_key,
+                execution,
+                principal=_auth_principal(request, st),
+                environment=env,
+                org_id=namespace.split("/", 1)[0],
+                namespace_id=ns_id,
+                multi_agent=bool(body.get("multiAgent") or body.get("multi_agent")),
+            )
+        if hasattr(result, "model_dump"):
+            return result.model_dump(mode="json")
+        return result
+
+    @app.post("/v1/{namespace:path}/{kind}/{name}/unpublish")
+    async def unpublish_resource(
+        namespace: str,
+        kind: str,
+        name: str,
+        request: Request,
+        body: UnpublishBody = UnpublishBody(),
+        environment: str | None = None,
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        try:
+            await st.registry.unpublish(ns_id, ResourceKind(kind), name)
+        except ValueError as e:
+            raise HTTPException(404, detail=str(e)) from e
+        return {"unpublished": True, "kind": kind, "name": name}
+
     # --- Dynamic Workflows ---
     @app.post("/v1/{namespace:path}/workflows/plan")
     async def plan_dynamic_workflow(
@@ -733,6 +1133,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(503, detail="No failover region available")
         return {"failed": name, "newPrimary": new_primary.model_dump()}
 
+    @app.post("/v1/regions/{name}/primary")
+    async def region_set_primary(name: str, request: Request):
+        st = state(request)
+        regions = await st.region_service.list_regions()
+        if not any(r.name == name for r in regions):
+            raise HTTPException(404, detail="Region not found")
+        await st.region_service.set_primary(name)
+        primary = await st.region_service.get_primary()
+        return {"primary": primary.model_dump() if primary else None}
+
     @app.post("/v1/edge/register")
     async def register_edge(body: RegisterEdgeBody, request: Request):
         st = state(request)
@@ -745,6 +1155,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body.metadata,
         )
         return {"nodeId": node_id, "namespaceId": ns_id, "mode": "edge"}
+
+    @app.get("/v1/edge/nodes")
+    async def list_edge_nodes(request: Request, limit: int = 100):
+        st = state(request)
+        nodes = await st.region_service.list_edge_nodes(limit=limit)
+        return {"nodes": nodes, "count": len(nodes)}
 
     @app.post("/v1/edge/{node_id}/telemetry")
     async def edge_telemetry(node_id: str, body: TelemetryBody, request: Request):
@@ -804,10 +1220,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result = await st.route_tuner.tune(route_ref, ns_id, route_spec)
         return result.model_dump()
 
+    @app.get("/v1/auth/config")
+    async def auth_config(request: Request):
+        st = state(request)
+        return st.sso_service.auth_config()
+
     @app.post("/v1/auth/login")
     async def login(body: LoginBody, request: Request):
         st = state(request)
-        return await st.sso_service.login(body.org_id, body.email, body.display_name)
+        try:
+            return await st.sso_service.login(body.org_id, body.email, body.display_name)
+        except PermissionError as e:
+            raise HTTPException(403, detail=str(e)) from e
+
+    @app.post("/v1/auth/oidc/start")
+    async def oidc_start(body: OidcStartBody, request: Request):
+        st = state(request)
+        from ai_platform.auth.oidc_provider import OidcProviderError
+
+        try:
+            return await st.sso_service.begin_oidc(
+                code_challenge=body.code_challenge,
+                org_id=body.org_id,
+                redirect_uri=body.redirect_uri,
+            )
+        except OidcProviderError as e:
+            raise HTTPException(400, detail=str(e)) from e
+
+    @app.post("/v1/auth/oidc/callback")
+    async def oidc_callback(body: OidcCallbackBody, request: Request):
+        st = state(request)
+        from ai_platform.auth.oidc_provider import OidcProviderError
+
+        try:
+            return await st.sso_service.complete_oidc(
+                code=body.code,
+                state=body.state,
+                code_verifier=body.code_verifier,
+                org_id=body.org_id,
+            )
+        except OidcProviderError as e:
+            raise HTTPException(400, detail=str(e)) from e
 
     @app.get("/v1/marketplace/plugins")
     async def list_marketplace_plugins(request: Request, tier: str | None = None):
@@ -853,17 +1306,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return result.model_dump()
 
+    @app.get("/v1/{namespace:path}/git-sync/repos")
+    async def list_git_repos(
+        namespace: str, request: Request, environment: str | None = None
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        repos = await st.git_sync.list_repos(ns_id)
+        return {"repos": repos}
+
     @app.post("/v1/{namespace:path}/git-export")
     async def git_export(
-        namespace: str, request: Request, directory: str = "./export", environment: str | None = None
+        namespace: str,
+        request: Request,
+        body: GitExportBody = GitExportBody(),
+        directory: str | None = None,
+        environment: str | None = None,
     ):
         st = state(request)
         env = environment or settings.default_env
         ns_id = await st.registry.ensure_namespace(namespace, env)
         from pathlib import Path
 
-        count = await st.git_sync.export_to_directory(ns_id, namespace, Path(directory))
-        return {"exported": count, "directory": directory}
+        out_dir = directory or body.directory or "./export"
+        count = await st.git_sync.export_to_directory(ns_id, namespace, Path(out_dir))
+        return {"exported": count, "directory": out_dir}
 
     @app.get("/scim/v2/Users")
     async def scim_list_users(request: Request, org_id: str = "default-org"):
@@ -886,17 +1354,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/{namespace:path}/terraform/export")
     async def terraform_export(
-        namespace: str, request: Request, directory: str = "./terraform", environment: str | None = None
+        namespace: str,
+        request: Request,
+        body: TerraformExportBody = TerraformExportBody(),
+        directory: str | None = None,
+        environment: str | None = None,
     ):
         st = state(request)
         env = environment or settings.default_env
         ns_id = await st.registry.ensure_namespace(namespace, env)
         published = await st.registry.list_published(ns_id)
         from pathlib import Path
-        from ai_platform.terraform.export import write_terraform_files
 
-        count = write_terraform_files(published, namespace, Path(directory))
-        return {"exported": count, "directory": directory}
+        from ai_platform.terraform.export import build_terraform_files, write_terraform_files
+
+        out_dir = directory or body.directory or "./terraform"
+        write = body.write
+        files = build_terraform_files(published, namespace)
+        resource_files = [
+            n for n in files if n.endswith(".tf") and n not in {"provider.tf", "variables.tf"}
+        ]
+        if write:
+            count = write_terraform_files(published, namespace, Path(out_dir))
+        else:
+            count = len(resource_files)
+        return {
+            "exported": count,
+            "directory": out_dir if write else None,
+            "wrote": write,
+            "files": sorted(files.keys()),
+            "preview": {
+                k: files[k] for k in ("provider.tf", "variables.tf", "exported.json") if k in files
+            },
+        }
+
+    @app.get("/v1/{namespace:path}/terraform/preview")
+    async def terraform_preview(
+        namespace: str, request: Request, environment: str | None = None
+    ):
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        published = await st.registry.list_published(ns_id)
+        from ai_platform.terraform.export import build_terraform_files
+
+        files = build_terraform_files(published, namespace)
+        return {
+            "namespace": namespace,
+            "resourceCount": len(
+                [n for n in files if n.endswith(".tf") and n not in {"provider.tf", "variables.tf"}]
+            ),
+            "files": files,
+        }
 
     @app.post("/v1/nodes/register")
     async def register_node(body: RegisterNodeBody, request: Request):
@@ -942,11 +1451,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ns_id = await st.registry.ensure_namespace(namespace, env)
         published = await st.registry.list_published(ns_id)
         bundle = _bundle_index(published)
+        # Include the version under publish so eval can execute against it.
+        draft = await st.registry.get_version(ns_id, ResourceKind(kind), name, body.version)
+        if draft:
+            bundle[f"{kind}:{name}"] = {
+                "kind": kind,
+                "name": name,
+                "spec": draft.spec_json,
+            }
         st.policy_engine.load_from_bundle(bundle)
 
+        from ai_platform.core.models import ExecutionRequest
+        from ai_platform.orchestrator.engine import Orchestrator
         from ai_platform.publish.service import PublishGateError
 
         principal = _auth_principal(request, st)
+        kind_slug = {
+            "Agent": "agents",
+            "Workflow": "workflows",
+            "Prompt": "prompts",
+            "Tool": "tools",
+            "EvaluationSuite": "evaluationsuites",
+        }.get(kind, kind.lower() + "s")
+        target_ref = f"{kind_slug}/{name}"
+
+        execute_fn = None
+        if kind == "Agent":
+
+            async def execute_fn(input_data: dict):  # noqa: F811
+                orch = Orchestrator(
+                    agent_engine=st.agent_engine,
+                    workflow_engine=st.workflow_engine,
+                    policy_engine=st.policy_engine,
+                )
+                bundle_key = f"{ns_id}:{env}:publish-eval"
+                orch.load_bundle(bundle_key, list(bundle.values()))
+                return await orch.execute(
+                    bundle_key,
+                    ExecutionRequest(resource_ref=target_ref, input=input_data, stream=False),
+                    principal=principal,
+                    environment=env,
+                    org_id=namespace.split("/", 1)[0],
+                    namespace_id=ns_id,
+                )
+
         try:
             result = await st.publish_service.publish_with_gates(
                 ns_id,
@@ -957,6 +1505,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 principal=body.principal if body.principal != "anonymous" else principal,
                 environment=env,
                 bundle=bundle,
+                execute_fn=execute_fn,
                 eval_suite_ref=body.eval_suite_ref,
             )
         except PublishGateError as e:
@@ -966,12 +1515,101 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return result
 
+    @app.post("/v1/{namespace:path}/evaluations/run")
+    async def run_evaluation(
+        namespace: str,
+        body: dict,
+        request: Request,
+        environment: str | None = None,
+    ):
+        """Run an EvaluationSuite against a target resource (publish-gate dry run)."""
+        st = state(request)
+        env = environment or settings.default_env
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        suite_ref = str(body.get("suiteRef") or body.get("evalSuiteRef") or "")
+        target_ref = str(body.get("targetRef") or body.get("resourceRef") or "")
+        target_version = str(body.get("targetVersion") or body.get("version") or "draft")
+        if not suite_ref:
+            raise HTTPException(400, detail="suiteRef is required")
+        if not target_ref:
+            raise HTTPException(400, detail="targetRef is required")
+
+        published = await st.registry.list_published(ns_id)
+        bundle = _bundle_index(published)
+
+        # Prefer published suite; fall back to named draft version if provided.
+        suite = st.eval_runner.load_suite_from_bundle(bundle, suite_ref)
+        if not suite:
+            suite_name = suite_ref.split("/", 1)[-1]
+            suite_ver = body.get("suiteVersion")
+            if suite_ver:
+                draft = await st.registry.get_version(
+                    ns_id, ResourceKind.EVALUATION_SUITE, suite_name, str(suite_ver)
+                )
+            else:
+                resource = await st.registry.get_resource(
+                    ns_id, ResourceKind.EVALUATION_SUITE, suite_name
+                )
+                draft = None
+                if resource and resource.latest_version:
+                    draft = await st.registry.get_version(
+                        ns_id,
+                        ResourceKind.EVALUATION_SUITE,
+                        suite_name,
+                        resource.latest_version,
+                    )
+            if draft:
+                bundle[f"EvaluationSuite:{suite_name}"] = {
+                    "kind": "EvaluationSuite",
+                    "name": suite_name,
+                    "spec": draft.spec_json,
+                }
+                suite = st.eval_runner.load_suite_from_bundle(
+                    bundle, f"evaluationsuites/{suite_name}"
+                )
+        if not suite:
+            raise HTTPException(404, detail=f"EvaluationSuite not found: {suite_ref}")
+
+        from ai_platform.core.models import ExecutionRequest
+        from ai_platform.orchestrator.engine import Orchestrator
+
+        principal = _auth_principal(request, st)
+        execute_fn = None
+        if target_ref.startswith("agents/"):
+
+            async def execute_fn(input_data: dict):  # noqa: F811
+                orch = Orchestrator(
+                    agent_engine=st.agent_engine,
+                    workflow_engine=st.workflow_engine,
+                    policy_engine=st.policy_engine,
+                )
+                bundle_key = f"{ns_id}:{env}:eval-run"
+                orch.load_bundle(bundle_key, list(bundle.values()))
+                return await orch.execute(
+                    bundle_key,
+                    ExecutionRequest(resource_ref=target_ref, input=input_data, stream=False),
+                    principal=principal,
+                    environment=env,
+                    org_id=namespace.split("/", 1)[0],
+                    namespace_id=ns_id,
+                )
+
+        result = await st.eval_runner.run_suite(
+            suite, target_ref, target_version, execute_fn
+        )
+        return result.to_dict()
+
+    @app.get("/v1/{namespace:path}/evaluations/recent")
+    async def recent_evaluations(namespace: str, request: Request, limit: int = 20):
+        st = state(request)
+        return {"runs": st.eval_runner.recent_runs(limit=min(max(limit, 1), 100))}
+
     @app.post("/v1/{namespace:path}/promote")
     async def promote_environment(namespace: str, body: PromoteBody, request: Request):
         st = state(request)
         ns_id = await st.registry.ensure_namespace(namespace, body.from_env)
         published = await st.registry.list_published(ns_id)
-        manifest = st.bundler.compile(f"{namespace:path}/{body.to_env}", body.to_env, published)
+        manifest = st.bundler.compile(f"{namespace}/{body.to_env}", body.to_env, published)
 
         promo_id = await st.promotion_service.request_promotion(
             ns_id, body.from_env, body.to_env, body.requested_by, manifest.bundle_hash
@@ -998,8 +1636,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/workflows/runs/{run_id}/approve")
     async def approve_workflow(run_id: str, body: WorkflowApproveBody, request: Request):
         st = state(request)
-        state_obj = await st.workflow_engine.approve(run_id, body.decision)
-        return state_obj.model_dump()
+        try:
+            state_obj = await st.workflow_engine.approve(run_id, body.decision)
+        except ValueError as e:
+            raise HTTPException(404, detail=str(e)) from e
+        return state_obj.model_dump(by_alias=True)
+
+    @app.get("/v1/workflows/inbox")
+    async def workflow_inbox(
+        request: Request,
+        namespace: str | None = None,
+        environment: str | None = None,
+        limit: int = 50,
+    ):
+        st = state(request)
+        ns_id = None
+        if namespace:
+            env = environment or settings.default_env
+            ns_id = await st.registry.ensure_namespace(namespace, env)
+        items = await st.workflow_engine.list_inbox(namespace_id=ns_id, limit=limit)
+        return {"items": items, "count": len(items)}
+
+    @app.get("/v1/workflows/runs/{run_id}")
+    async def get_workflow_run(run_id: str, request: Request):
+        st = state(request)
+        item = await st.workflow_engine.get_run(run_id)
+        if not item:
+            raise HTTPException(404, detail="Run not found")
+        return item
 
     @app.post("/v1/workflows/runs/{run_id}/resume")
     async def resume_workflow(
@@ -1011,10 +1675,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ns_id = await st.registry.ensure_namespace(ns_path, env)
         published = await st.registry.list_published(ns_id)
         bundle = _bundle_index(published)
-        state_obj = await st.workflow_engine.resume(
-            run_id, bundle, ns_path.split("/")[0], ns_id
-        )
-        return state_obj.model_dump()
+        try:
+            state_obj = await st.workflow_engine.resume(
+                run_id, bundle, ns_path.split("/")[0], ns_id
+            )
+        except ValueError as e:
+            raise HTTPException(404, detail=str(e)) from e
+        return state_obj.model_dump(by_alias=True)
 
     @app.get("/v1/bundles/{environment}")
     async def get_bundle(environment: str, request: Request, namespace: str | None = None):

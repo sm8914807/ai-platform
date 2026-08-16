@@ -8,13 +8,29 @@ spec:
   adapter: mcp
   manifest:
     name: get-customer
-    description: Fetch customer by ID
+    description: Fetch customer by ID via MCP CRM server
     inputSchema:
       type: object
       properties:
         customerId:
           type: string
+      required: [customerId]
     outputSchema:
       type: object
+  # Production MCP config — pick ONE transport:
+  # A) Streamable HTTP remote server
+  # config:
+  #   transport: http
+  #   server: crm-mcp
+  #   url: https://mcp.example.com/mcp
+  #   toolName: get-customer
+  #   authRef: secrets/mcp-crm-token
+  # B) Local stdio server (allowlisted binary)
   config:
+    transport: stdio
     server: crm-mcp
+    command: python3
+    args:
+      - tests/fixtures/mcp_echo_server.py
+    toolName: get-customer
+  rateLimit: "60/m"
