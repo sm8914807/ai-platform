@@ -1,4 +1,4 @@
-"""Real model provider adapters — OpenAI, Anthropic, Bedrock (+ mock)."""
+"""Real model provider adapters — OpenAI, Anthropic, Bedrock, Gemini (+ mock)."""
 
 from __future__ import annotations
 
@@ -282,6 +282,104 @@ class BedrockProvider(ModelProvider):
         )
 
 
+class GeminiProvider(ModelProvider):
+    """Google Generative Language API (Gemini)."""
+
+    name = "gemini"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str = "https://generativelanguage.googleapis.com/v1beta",
+    ) -> None:
+        self.api_key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+            or os.getenv("GOOGLE_GENAI_API_KEY")
+            or ""
+        )
+        self.base_url = base_url.rstrip("/")
+
+    async def complete(self, model: str, request: ModelRequest) -> ModelResponse:
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY / GOOGLE_API_KEY not configured")
+        start = time.perf_counter()
+
+        system_parts = [
+            str(m["content"]) for m in request.messages if m.get("role") == "system"
+        ]
+        contents: list[dict[str, Any]] = []
+        for m in request.messages:
+            role = m.get("role")
+            if role == "system":
+                continue
+            # Gemini uses "user" / "model" (not assistant).
+            gem_role = "model" if role == "assistant" else "user"
+            contents.append(
+                {"role": gem_role, "parts": [{"text": str(m.get("content", ""))}]}
+            )
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": ""}]}]
+
+        body: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": request.temperature,
+            },
+        }
+        if request.max_tokens:
+            body["generationConfig"]["maxOutputTokens"] = request.max_tokens
+        if system_parts:
+            body["systemInstruction"] = {
+                "parts": [{"text": "\n\n".join(system_parts)}]
+            }
+
+        # Accept short aliases from Studio ModelRoute forms.
+        model_id = model
+        if model_id.startswith("models/"):
+            model_id = model_id.split("/", 1)[1]
+        if model_id in {"gemini-flash", "gemini-flash-latest", "flash"}:
+            model_id = "gemini-2.5-flash"
+        elif model_id in {"gemini-pro", "pro"}:
+            model_id = "gemini-2.5-pro"
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{self.base_url}/models/{model_id}:generateContent",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-goog-api-key": self.api_key,
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        text = ""
+        for cand in data.get("candidates") or []:
+            content = cand.get("content") or {}
+            for part in content.get("parts") or []:
+                if "text" in part:
+                    text += part["text"]
+        usage_meta = data.get("usageMetadata") or {}
+        prompt_tokens = int(usage_meta.get("promptTokenCount") or 0)
+        completion_tokens = int(usage_meta.get("candidatesTokenCount") or 0)
+        return ModelResponse(
+            content=text,
+            provider=self.name,
+            model=model_id,
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": int(
+                    usage_meta.get("totalTokenCount") or (prompt_tokens + completion_tokens)
+                ),
+            },
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
+
+
 def build_default_providers() -> dict[str, ModelProvider]:
     """Register mock always; real providers when keys/env present."""
     from ai_platform.model_router.router import MockModelProvider
@@ -290,6 +388,7 @@ def build_default_providers() -> dict[str, ModelProvider]:
     providers["openai"] = OpenAIProvider()
     providers["anthropic"] = AnthropicProvider()
     providers["bedrock"] = BedrockProvider()
+    providers["gemini"] = GeminiProvider()
     # Azure OpenAI compatible via openai base URL
     azure_key = os.getenv("AZURE_OPENAI_API_KEY")
     azure_base = os.getenv("AZURE_OPENAI_ENDPOINT")
