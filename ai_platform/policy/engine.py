@@ -19,6 +19,13 @@ class PolicyEngine:
                 specs.append(PolicySpec.model_validate(doc["spec"]))
         self._policies = specs
 
+    def has_action_rules(self, action: str) -> bool:
+        for policy in self._policies:
+            for rule in policy.rules:
+                if self._match_action(rule.actions, action):
+                    return True
+        return False
+
     def evaluate(self, ctx: PolicyContext) -> PolicyDecision:
         if not self._policies:
             return PolicyDecision(allowed=True, reason="no policies configured")
@@ -47,6 +54,14 @@ class PolicyEngine:
             return PolicyDecision(allowed=False, reason="explicit deny", matched_rule=matched)
         if allow_match:
             return PolicyDecision(allowed=True, reason="explicit allow", matched_rule=matched)
+        # Newly gated actions soft-allow until operators publish matching rules,
+        # so existing agent:run / resource:publish policies stay fail-closed.
+        if ctx.action in {"tool:invoke", "workflow:run"} and not self.has_action_rules(ctx.action):
+            return PolicyDecision(
+                allowed=True,
+                reason="no rules for action (compat allow)",
+                matched_rule=None,
+            )
         return PolicyDecision(allowed=False, reason="default deny (fail closed)")
 
     def _match_principal(self, principals: list[str], principal: str) -> bool:

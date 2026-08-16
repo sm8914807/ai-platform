@@ -364,6 +364,9 @@ class MultiAgentResult(BaseModel):
     iterations: int
     steps: list[dict[str, Any]] = Field(default_factory=list)
     final_output: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["completed", "failed", "partial"] = "completed"
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    wiring: dict[str, str] = Field(default_factory=dict)
 
 
 # --- Phase 4 models ---

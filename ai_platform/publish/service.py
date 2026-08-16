@@ -63,7 +63,19 @@ class PublishService:
             )
         )
         if not decision.allowed:
-            raise PublishGateError("policy_denied", {"reason": decision.reason})
+            raise PublishGateError(
+                "policy_denied",
+                {
+                    "reason": decision.reason,
+                    "matchedRule": decision.matched_rule,
+                    "action": "resource:publish",
+                    "resource": resource_ref,
+                    "diagnosis": (
+                        "A published Policy denied this publish. "
+                        "Allow resource:publish for the principal or adjust deny rules."
+                    ),
+                },
+            )
 
         eval_summary: list[dict[str, Any]] = []
         # Skip eval recursion when publishing the suite itself.

@@ -351,10 +351,16 @@ export const api = {
     resourceRef: string,
     input: Record<string, unknown>,
     multiAgent = false,
+    collaboration?: Record<string, unknown>,
   ) =>
     request<ExecutionEvent>(`/v1/${ns}/execute`, {
       method: "POST",
-      body: JSON.stringify({ resource_ref: resourceRef, input, multiAgent }),
+      body: JSON.stringify({
+        resource_ref: resourceRef,
+        input,
+        multiAgent,
+        ...(collaboration ? { collaboration } : {}),
+      }),
     }),
   listNamespaces: () =>
     request<{ namespaces: NamespaceInfo[]; default: string; environment: string }>(

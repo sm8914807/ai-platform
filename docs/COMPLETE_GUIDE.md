@@ -606,7 +606,7 @@ Used on: publish, agent run (orchestrator).
 | `resources` | Resources | Catalog of CRDs | `GET .../resources` |
 | `editor` | Resource editor | Forms + JSON + publish + agent test | upsert, publish, execute |
 | `workflows` | Dynamic flows | Goal plan & run + quick HITL | `.../workflows/plan`, approve/resume |
-| `collaboration` | Multi-agent | Pattern inspector + forced run | execute with multiAgent |
+| `collaboration` | Multi-agent | Role wiring, timeline, diagnosis | execute + collaboration override |
 | `traces` | Context graph | Traces + precedents | `.../traces*` |
 | `discovery` | Discovery | List agents + register capabilities | discovery/* |
 | `messaging` | Message bus | Inbox / messages | messages/* |
@@ -738,13 +738,13 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | CRD registry + versioning | **Real** | Yes | SQLite/Postgres |
 | Publish + signed bundles | **Real** | Yes | Ed25519 |
 | Agent execute path | **Real** | Yes (test button) | Mock model by default |
-| Multi-agent patterns | **Real** | Partial | Via agent collaboration spec |
+| Multi-agent patterns | **Real** | Yes (Build → Multi-agent) | Role wiring, turn timeline, failure diagnosis |
 | Workflows + HITL APIs | **Real** | Yes (Runtime → HITL inbox) | Approve/resume + durable pending metadata; inbox lists waiting runs |
 | Dynamic plan | **Real (LLM + fallback)** | Yes | LLM via ModelRouter; heuristic if parse fails |
 | Discovery | **Real** | Yes | Register + list |
 | Context graph | **Real** | Yes | |
 | Secrets | **Real** | Yes | Dev key default |
-| Policies / guardrails | **Real** | Forms yes | Enforcement on some paths |
+| Policies / guardrails | **Real** | Forms yes | Enforced on publish, agent/workflow run, tool:invoke, MCP call; injection block hard-stops |
 | Model providers (OpenAI/…) | **Real adapters** | Form yes | Needs keys; mock default |
 | MCP tools | **Real (stdio + HTTP)** | Tool form | Sandboxed; `/v1/.../mcp/list` + `/mcp/call` |
 | **Auth enforced** | **Real (default on)** | Login screen | JWT middleware; set `PLATFORM_AUTH_REQUIRED=false` only for local tests |
@@ -760,7 +760,7 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | OTLP on API | **Real** | — | Lifespan setup/shutdown; HTTP + execute spans; OTLP/HTTP export |
 | Eval judge quality | **Real** | Yes (Ops → Evaluations) | Keyword, latency, tool, LLM judges; publish auto-triggers |
 | Multi-namespace switcher | **Real** | Yes (topbar) | Persist NS; ensure + list APIs |
-| Multi-agent collaboration UI | **Real** | Yes (Build → Multi-agent) | Pattern inspector + forced run |
+| Multi-agent collaboration UI | **Real** | Yes (Build → Multi-agent) | Role wiring + timeline + diagnosis |
 | Resource actions | **Real** | Yes | New / Clone / Edit / Unpublish (not hard-delete) |
 | Knowledge / Memory / Environment / Eval forms | **Real** | Yes | Editor visual forms |
 | CI Postgres + console e2e | **Real** | — | `test-postgres` + `console-e2e` in CI |
@@ -772,9 +772,11 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 
 Ordered by remaining leverage:
 
-1. Hard resource delete (optional); deeper multi-agent Studio tooling.
+1. Production auth/ops hardening (require secrets key, disable dev login in prod checks).
+2. Hard resource delete (optional); SCIM admin UI; richer e2e (HITL/OIDC).
+3. Audit/activity log in Studio; Redis-backed governor for multi-instance.
 
-**Recently shipped:** regions/edge Studio; HITL run inbox; real OIDC; OTLP tracing on API lifespan.
+**Recently shipped:** deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
 
 ---
 

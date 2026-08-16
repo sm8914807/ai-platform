@@ -27,6 +27,8 @@ import {
 } from "./api";
 import {
   AgentGraph,
+  collaborationNodes,
+  collaborationRoles,
   DiscoveryMap,
   FlowLane,
   MessagingGraph,
@@ -1370,11 +1372,15 @@ function EditorView({
 function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
   const [resources, setResources] = useState<Resource[]>([]);
   const [agentRef, setAgentRef] = useState("agents/multi-support-agent");
+  const [pattern, setPattern] = useState("planner_executor_reviewer");
+  const [wiring, setWiring] = useState<Record<string, string>>({});
+  const [maxIterations, setMaxIterations] = useState(2);
   const [input, setInput] = useState('{"message":"Plan then answer a billing refund request"}');
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saveBusy, setSaveBusy] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     api
       .listResources(ns)
       .then((r) => {
@@ -1391,17 +1397,58 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
       .catch((e) => onError(String(e.message ?? e)));
   }, [ns, onError]);
 
+  useEffect(() => {
+    load();
+  }, [load]);
+
   const agents = resources.filter((r) => r.kind === "Agent");
   const selected = agents.find((a) => `agents/${a.name}` === agentRef);
   const collab = (selected?.spec as Spec | undefined)?.collaboration as Spec | undefined;
+
+  useEffect(() => {
+    const nextPattern = String(collab?.pattern ?? "planner_executor_reviewer");
+    setPattern(nextPattern);
+    setMaxIterations(Number(collab?.maxIterations ?? 2));
+    const roles = collaborationRoles(nextPattern);
+    const agentsMap = (collab?.agents as Record<string, string> | undefined) ?? {};
+    const next: Record<string, string> = {};
+    for (const role of roles) {
+      next[role] =
+        agentsMap[role] ??
+        (role === "worker"
+          ? Object.entries(agentsMap).find(([k]) => k.startsWith("worker"))?.[1] ??
+            (agents[0] ? `agents/${agents[0].name}` : "")
+          : agentsMap[role] ?? (agents[0] ? `agents/${agents[0].name}` : ""));
+    }
+    // Preserve extra worker* keys
+    for (const [k, v] of Object.entries(agentsMap)) {
+      if (k.startsWith("worker") && k !== "worker") next[k] = v;
+    }
+    setWiring(next);
+  }, [agentRef, selected?.name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const roles = collaborationRoles(pattern);
+  const steps = Array.isArray(result?.steps)
+    ? (result?.steps as Array<Record<string, unknown>>)
+    : [];
+  const errors = Array.isArray(result?.errors)
+    ? (result?.errors as Array<Record<string, unknown>>)
+    : [];
+  const status = String(result?.status ?? "");
 
   async function run() {
     setBusy(true);
     setResult(null);
     try {
       const payload = JSON.parse(input) as Record<string, unknown>;
-      const r = await api.runResource(ns, agentRef, payload, true);
-      setResult(r as unknown as Record<string, unknown>);
+      const collaboration = {
+        pattern,
+        maxIterations,
+        sharedContext: true,
+        agents: wiring,
+      };
+      const r = await api.runResource(ns, agentRef, payload, true, collaboration);
+      setResult((r.data ?? r) as unknown as Record<string, unknown>);
     } catch (e) {
       onError(String((e as Error).message ?? e));
     } finally {
@@ -1409,15 +1456,49 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
     }
   }
 
+  async function saveWiring() {
+    if (!selected) return;
+    setSaveBusy(true);
+    try {
+      const nextSpec = {
+        ...(selected.spec as Spec),
+        collaboration: {
+          pattern,
+          maxIterations,
+          sharedContext: true,
+          agents: wiring,
+        },
+      };
+      await api.upsertResource(ns, "Agent", selected.name, selected.version, nextSpec);
+      await api.publishResource(ns, "Agent", selected.name, selected.version);
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
   return (
     <section>
-      <header className="page-header">
-        <h1>Multi-agent collaboration</h1>
-        <p className="muted">
-          Run planner/executor/reviewer, supervisor/workers, or peer patterns defined on an Agent
-          CRD. Orchestrator uses collaboration when present (or force via multiAgent).
-        </p>
+      <header className="page-header row">
+        <div>
+          <h1>Multi-agent collaboration</h1>
+          <p className="muted">
+            Wire roles to published agents, run a pattern, and inspect the turn timeline with
+            failure diagnosis.
+          </p>
+        </div>
+        <div className="form-row">
+          <button className="ghost" disabled={saveBusy || !selected} onClick={() => void saveWiring()}>
+            {saveBusy ? "Saving…" : "Save wiring"}
+          </button>
+          <button className="primary" disabled={busy || agents.length === 0} onClick={() => void run()}>
+            {busy ? "Running…" : "Run collaboration"}
+          </button>
+        </div>
       </header>
+
       <div className="form-row">
         <select value={agentRef} onChange={(e) => setAgentRef(e.target.value)}>
           {agents.map((a) => (
@@ -1427,34 +1508,53 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
             </option>
           ))}
         </select>
-        <button className="primary" disabled={busy || agents.length === 0} onClick={run}>
-          {busy ? "Running…" : "Run collaboration"}
-        </button>
+        <select value={pattern} onChange={(e) => setPattern(e.target.value)}>
+          <option value="planner_executor_reviewer">planner → executor → reviewer</option>
+          <option value="supervisor_workers">supervisor → workers</option>
+          <option value="hierarchical">hierarchical</option>
+          <option value="peer_round_robin">peer round-robin</option>
+        </select>
+        <label className="check-row">
+          Max iterations
+          <input
+            type="number"
+            min={1}
+            max={8}
+            value={maxIterations}
+            onChange={(e) => setMaxIterations(Number(e.target.value) || 1)}
+            style={{ width: "4rem" }}
+          />
+        </label>
       </div>
-      {collab ? (
-        <div className="panel" style={{ marginBottom: "1rem" }}>
-          <div className="form-section-title">
-            Pattern <span className="badge">{String(collab.pattern)}</span>
+
+      <div className="split" style={{ marginBottom: "1rem" }}>
+        <div className="panel">
+          <div className="form-section-title">Role wiring</div>
+          <p className="muted form-hint">Map each pattern role to a published agent.</p>
+          <div className="form-stack">
+            {roles.map((role) => (
+              <label key={role} className="wiring-row">
+                <span className="mono">{role}</span>
+                <select
+                  value={wiring[role] ?? ""}
+                  onChange={(e) => setWiring((w) => ({ ...w, [role]: e.target.value }))}
+                >
+                  <option value="">Select agent…</option>
+                  {agents.map((a) => (
+                    <option key={a.name} value={`agents/${a.name}`}>
+                      agents/{a.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ))}
           </div>
-          <dl className="inspector-meta">
-            <dt>Max iterations</dt>
-            <dd>{String(collab.maxIterations ?? 3)}</dd>
-            <dt>Shared context</dt>
-            <dd>{String(collab.sharedContext ?? true)}</dd>
-            <dt>Agents</dt>
-            <dd className="mono">{JSON.stringify(collab.agents ?? {})}</dd>
-          </dl>
-          <AgentGraph resources={resources} />
+          <div style={{ marginTop: "1rem" }}>
+            <FlowLane title="Pattern graph" nodes={collaborationNodes(pattern, wiring)} />
+          </div>
         </div>
-      ) : (
-        <p className="muted">
-          Selected agent has no <span className="mono">collaboration</span> block — run still
-          forces multi-agent mode (falls back to single if no pattern is discovered). Add a
-          pattern in the Resource editor Agent form.
-        </p>
-      )}
-      <div className="panel test-agent-panel">
-        <div>
+
+        <div className="panel">
           <div className="form-section-title">Input</div>
           <textarea
             className="code editor test-input"
@@ -1462,16 +1562,85 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
             onChange={(e) => setInput(e.target.value)}
             spellCheck={false}
           />
-        </div>
-        <div>
-          <div className="form-section-title">Result steps</div>
-          <pre className="code test-result">
-            {result
-              ? JSON.stringify(result, null, 2)
-              : "Run to see pattern, iterations, and per-role steps."}
-          </pre>
+          {result && (
+            <div style={{ marginTop: "0.75rem" }}>
+              <span
+                className={
+                  status === "completed" ? "badge ok" : status === "partial" ? "badge warn" : "badge danger"
+                }
+              >
+                {status || "done"}
+              </span>{" "}
+              <span className="muted mono">
+                {String(result.pattern ?? pattern)} · {String(result.iterations ?? "—")} iteration(s)
+              </span>
+            </div>
+          )}
         </div>
       </div>
+
+      {errors.length > 0 && (
+        <div className="panel" style={{ marginBottom: "1rem", borderColor: "var(--danger, #b33)" }}>
+          <div className="form-section-title">Failure diagnosis</div>
+          {errors.map((err, i) => (
+            <div key={i} className="diagnosis-card">
+              <div>
+                <span className="badge danger">{String(err.code ?? "error")}</span>{" "}
+                <span className="mono">
+                  {String(err.role ?? "")}
+                  {err.ref ? ` · ${String(err.ref)}` : ""}
+                </span>
+              </div>
+              <div>{String(err.message ?? "")}</div>
+              {err.diagnosis != null && err.diagnosis !== "" ? (
+                <p className="muted">{String(err.diagnosis)}</p>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="panel">
+        <div className="form-section-title">Turn timeline</div>
+        {steps.length === 0 ? (
+          <p className="muted">Run a collaboration to see planner/executor/reviewer turns.</p>
+        ) : (
+          <ol className="turn-timeline">
+            {steps.map((step, i) => {
+              const st = String(step.status ?? "ok");
+              return (
+                <li key={i} className={`turn-item turn-${st}`}>
+                  <div className="turn-head">
+                    <span className="turn-index">#{Number(step.turn ?? i + 1)}</span>
+                    <span className="mono">{String(step.role)}</span>
+                    <span className="muted mono">{String(step.ref ?? "")}</span>
+                    <span
+                      className={
+                        st === "ok" ? "badge ok" : st === "paused" ? "badge warn" : "badge danger"
+                      }
+                    >
+                      {st}
+                    </span>
+                    {step.latencyMs != null && (
+                      <span className="muted mono">{Number(step.latencyMs).toFixed(0)} ms</span>
+                    )}
+                  </div>
+                  {step.preview != null && <div className="turn-preview">{String(step.preview)}</div>}
+                  {step.error != null && <div className="turn-error">{String(step.error)}</div>}
+                  {step.diagnosis != null && <div className="muted">{String(step.diagnosis)}</div>}
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
+
+      {result && (
+        <details style={{ marginTop: "1rem" }}>
+          <summary className="muted">Raw result JSON</summary>
+          <pre className="code">{JSON.stringify(result, null, 2)}</pre>
+        </details>
+      )}
     </section>
   );
 }

@@ -69,15 +69,26 @@ class GuardrailPipeline:
                 specs.append(GuardrailSpec.model_validate(doc["spec"]))
         return specs
 
-    async def run_input(self, text: str, specs: list[GuardrailSpec]) -> tuple[str, list[str]]:
+    async def run_input(self, text: str, specs: list[GuardrailSpec]) -> tuple[str, list[str], bool]:
+        """Return (text, alerts, blocked). blocked=True when a plugin clears text to stop execution."""
         alerts: list[str] = []
         out = text
+        blocked = False
         for spec in specs:
             plugin = self._plugins.get(spec.type)
             if plugin:
+                before = out
                 out, a = await plugin.apply(out, spec.config)
                 alerts.extend(a)
-        return out, alerts
+                if (
+                    spec.type == "injection_detect"
+                    and spec.config.get("action", "alert") == "block"
+                    and "injection_pattern_detected" in a
+                    and out == ""
+                    and before
+                ):
+                    blocked = True
+        return out, alerts, blocked
 
-    async def run_output(self, text: str, specs: list[GuardrailSpec]) -> tuple[str, list[str]]:
+    async def run_output(self, text: str, specs: list[GuardrailSpec]) -> tuple[str, list[str], bool]:
         return await self.run_input(text, specs)

@@ -8,6 +8,7 @@ from ai_platform.core.models import (
     ExecutionEvent,
     MemoryProfileSpec,
     ModelRouteSpec,
+    PolicyContext,
     ToolboxEntry,
     ToolSpec,
     ToolboxSpec,
@@ -19,6 +20,7 @@ from ai_platform.knowledge.service import KnowledgeService
 from ai_platform.memory.service import MemoryService
 from ai_platform.model_router.providers import build_default_providers
 from ai_platform.model_router.router import ModelRouter, ModelRequest
+from ai_platform.policy.engine import PolicyEngine
 from ai_platform.tool_host.host import ToolHost
 from ai_platform.tool_host.sandbox import SandboxedToolHost
 
@@ -36,6 +38,7 @@ class AgentEngine:
         context_engineer: ContextEngineer | None = None,
         governor: ToolGovernor | None = None,
         metrics_collector: Any | None = None,
+        policy_engine: PolicyEngine | None = None,
     ) -> None:
         self.model_router = model_router or ModelRouter(
             providers=build_default_providers(),
@@ -50,6 +53,7 @@ class AgentEngine:
         self.context_engineer = context_engineer or ContextEngineer()
         self.governor = governor or ToolGovernor(fail_closed=False)
         self.metrics_collector = metrics_collector
+        self.policy_engine = policy_engine
 
     def _resolve(self, bundle: dict[str, dict], ref: str) -> dict[str, Any] | None:
         parts = ref.split("/", 1)
@@ -65,11 +69,80 @@ class AgentEngine:
             "memory": "MemoryProfile",
             "knowledge": "KnowledgeSource",
             "guardrails": "Guardrail",
+            "policies": "Policy",
         }
         kind = kind_map.get(plural)
         if not kind:
             return None
         return bundle.get(f"{kind}:{name}")
+
+    def _check_policy(
+        self,
+        policy_engine: PolicyEngine | None,
+        *,
+        principal: str,
+        action: str,
+        resource: str,
+        environment: str,
+        org_id: str,
+        agent_policy_refs: list[str] | None = None,
+        bundle: dict[str, dict] | None = None,
+    ) -> ExecutionEvent | None:
+        engine = policy_engine or self.policy_engine
+        if engine is None:
+            return None
+        ctx = PolicyContext(
+            principal=principal,
+            action=action,
+            resource=resource,
+            environment=environment,
+            org_id=org_id,
+        )
+        decision = engine.evaluate(ctx)
+        if not decision.allowed:
+            return ExecutionEvent(
+                type="error",
+                data={
+                    "message": "policy denied",
+                    "reason": decision.reason,
+                    "matchedRule": decision.matched_rule,
+                    "action": action,
+                    "resource": resource,
+                    "diagnosis": (
+                        f"Policy denied {action} on {resource}. "
+                        "Add an allow rule for this principal or adjust deny rules."
+                    ),
+                },
+            )
+        if agent_policy_refs and bundle is not None:
+            from ai_platform.core.models import PolicySpec
+
+            scoped = PolicyEngine()
+            specs = []
+            for ref in agent_policy_refs:
+                doc = self._resolve(bundle, ref)
+                if doc:
+                    specs.append(PolicySpec.model_validate(doc["spec"]))
+            if specs:
+                scoped._policies = specs
+                scoped_decision = scoped.evaluate(ctx)
+                if not scoped_decision.allowed:
+                    return ExecutionEvent(
+                        type="error",
+                        data={
+                            "message": "policy denied",
+                            "reason": scoped_decision.reason,
+                            "matchedRule": scoped_decision.matched_rule,
+                            "action": action,
+                            "resource": resource,
+                            "scope": "agent.policies",
+                            "diagnosis": (
+                                "Agent-scoped Policy refs denied this action. "
+                                f"Check {', '.join(agent_policy_refs)}."
+                            ),
+                        },
+                    )
+        return None
 
     async def execute(
         self,
@@ -80,6 +153,9 @@ class AgentEngine:
         session_id: str | None = None,
         org_id: str = "default",
         namespace_id: str = "local",
+        principal: str = "anonymous",
+        environment: str = "development",
+        policy_engine: PolicyEngine | None = None,
     ) -> AsyncIterator[ExecutionEvent] | ExecutionEvent:
         execution_id = new_id("exec")
         agent_doc = self._resolve(bundle_resources, agent_ref)
@@ -96,6 +172,24 @@ class AgentEngine:
             return event
 
         spec = AgentSpec.model_validate(agent_doc["spec"])
+        denied = self._check_policy(
+            policy_engine,
+            principal=principal,
+            action="agent:run",
+            resource=agent_ref,
+            environment=environment,
+            org_id=org_id,
+            agent_policy_refs=spec.policies,
+            bundle=bundle_resources,
+        )
+        if denied:
+            denied.execution_id = execution_id
+            if stream:
+                async def _deny():
+                    yield denied
+                return _deny()
+            return denied
+
         prompt_doc = self._resolve(bundle_resources, spec.prompt_ref)
         model_doc = self._resolve(bundle_resources, spec.model_ref)
 
@@ -110,9 +204,27 @@ class AgentEngine:
         guardrail_specs = self.guardrail_pipeline.load_from_bundle(
             bundle_resources, spec.guardrails
         )
-        user_content, alerts = await self.guardrail_pipeline.run_input(
+        user_content, alerts, blocked = await self.guardrail_pipeline.run_input(
             user_content, guardrail_specs
         )
+        if blocked:
+            event = ExecutionEvent(
+                type="error",
+                data={
+                    "message": "guardrail blocked input",
+                    "guardrailAlerts": alerts,
+                    "diagnosis": (
+                        "An injection_detect guardrail with action=block stopped this run. "
+                        "Remove the injection pattern from input or set action to alert."
+                    ),
+                },
+                execution_id=execution_id,
+            )
+            if stream:
+                async def _blocked():
+                    yield event
+                return _blocked()
+            return event
 
         retrieval_context = ""
         if spec.knowledge_refs:
@@ -134,7 +246,6 @@ class AgentEngine:
 
         raw_messages = history_messages + [{"role": "user", "content": prompt_text}]
 
-        # Context engineering — token budget, relevance filter, summarization
         if memory_profile:
             for layer in memory_profile.layers:
                 if layer.max_tokens:
@@ -173,6 +284,20 @@ class AgentEngine:
 
             if bound_tools and input_data.get("use_tool"):
                 entry, tool_spec = bound_tools[0]
+                tool_denied = self._check_policy(
+                    policy_engine,
+                    principal=principal,
+                    action="tool:invoke",
+                    resource=entry.ref,
+                    environment=environment,
+                    org_id=org_id,
+                    agent_policy_refs=spec.policies,
+                    bundle=bundle_resources,
+                )
+                if tool_denied:
+                    tool_denied.execution_id = execution_id
+                    yield tool_denied
+                    return
                 quota = entry.rate_limit or tool_spec.rate_limit
                 if not input_data.get("governor_override"):
                     decision = await self.governor.check(
@@ -212,9 +337,23 @@ class AgentEngine:
                 route_name=spec.model_ref,
                 namespace_id=namespace_id,
             )
-            output_text, out_alerts = await self.guardrail_pipeline.run_output(
+            output_text, out_alerts, out_blocked = await self.guardrail_pipeline.run_output(
                 response.content, guardrail_specs
             )
+            if out_blocked:
+                yield ExecutionEvent(
+                    type="error",
+                    data={
+                        "message": "guardrail blocked output",
+                        "guardrailAlerts": out_alerts,
+                        "diagnosis": (
+                            "Output guardrail blocked the model response. "
+                            "Review guardrail config or model prompt."
+                        ),
+                    },
+                    execution_id=execution_id,
+                )
+                return
 
             for chunk in output_text.split(" "):
                 yield ExecutionEvent(
@@ -260,4 +399,6 @@ class AgentEngine:
         events: list[ExecutionEvent] = []
         async for ev in _stream():
             events.append(ev)
-        return events[-1] if events else ExecutionEvent(type="error", data={}, execution_id=execution_id)
+        return events[-1] if events else ExecutionEvent(
+            type="error", data={}, execution_id=execution_id
+        )

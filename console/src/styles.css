@@ -294,6 +294,54 @@ input:focus, textarea:focus, select:focus {
 .form-stack > select {
   width: 100%;
 }
+.wiring-row {
+  display: grid;
+  grid-template-columns: 7rem 1fr;
+  gap: 0.5rem;
+  align-items: center;
+}
+.turn-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.turn-item {
+  border-left: 3px solid var(--border);
+  padding: 0.55rem 0.75rem;
+  background: var(--bg-muted, #f6f7f9);
+  border-radius: 0 8px 8px 0;
+}
+.turn-item.turn-ok { border-left-color: var(--success, #1f8a5b); }
+.turn-item.turn-error,
+.turn-item.turn-missing { border-left-color: var(--danger, #b33); }
+.turn-item.turn-paused { border-left-color: var(--warn, #b7791f); }
+.turn-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  margin-bottom: 0.25rem;
+}
+.turn-index {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.turn-preview {
+  font-size: 0.92rem;
+  line-height: 1.4;
+}
+.turn-error {
+  color: var(--danger, #b33);
+  font-size: 0.9rem;
+}
+.diagnosis-card {
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.diagnosis-card:last-child { border-bottom: none; }
 .check-row {
   display: inline-flex;
   align-items: center;

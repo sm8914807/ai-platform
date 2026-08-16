@@ -53,6 +53,7 @@ class Orchestrator:
         org_id: str = "default-org",
         namespace_id: str = "local",
         multi_agent: bool = False,
+        collaboration: Any | None = None,
     ) -> AsyncIterator[ExecutionEvent] | ExecutionEvent | Any:
         bundle = self._bundle_index.get(bundle_key, {})
         trace_id = request.trace_id or new_id("trace")
@@ -60,7 +61,9 @@ class Orchestrator:
         decision = self.policy_engine.evaluate(
             PolicyContext(
                 principal=principal,
-                action="agent:run",
+                action="agent:run" if request.resource_ref.startswith("agents/") else (
+                    "workflow:run" if request.resource_ref.startswith("workflows/") else "resource:run"
+                ),
                 resource=request.resource_ref,
                 environment=environment,
                 org_id=org_id,
@@ -69,7 +72,22 @@ class Orchestrator:
         if not decision.allowed:
             event = ExecutionEvent(
                 type="error",
-                data={"message": "policy denied", "reason": decision.reason},
+                data={
+                    "message": "policy denied",
+                    "reason": decision.reason,
+                    "matchedRule": decision.matched_rule,
+                    "action": (
+                        "agent:run"
+                        if request.resource_ref.startswith("agents/")
+                        else "workflow:run"
+                        if request.resource_ref.startswith("workflows/")
+                        else "resource:run"
+                    ),
+                    "diagnosis": (
+                        "A published Policy denied this execution. "
+                        "Allow the principal for this action/resource or remove the deny rule."
+                    ),
+                },
                 execution_id=trace_id,
             )
             if request.stream:
@@ -85,21 +103,48 @@ class Orchestrator:
             if request.resource_ref.startswith("agents/"):
                 use_multi = multi_agent or self._has_collaboration(bundle, request.resource_ref)
                 if use_multi:
+                    from ai_platform.core.models import CollaborationSpec
+
+                    override = None
+                    if collaboration is not None:
+                        override = (
+                            collaboration
+                            if isinstance(collaboration, CollaborationSpec)
+                            else CollaborationSpec.model_validate(collaboration)
+                        )
                     result = await self.multi_agent_engine.run(
                         bundle,
                         request.resource_ref,
                         request.input,
+                        collaboration=override,
                         session_id=request.session_id,
                         org_id=org_id,
                         namespace_id=namespace_id,
+                        principal=principal,
+                        environment=environment,
+                        policy_engine=self.policy_engine,
                     )
                     event = ExecutionEvent(
-                        type="done",
+                        type="done" if result.status != "failed" else "error",
                         data={
                             "pattern": result.pattern,
                             "iterations": result.iterations,
                             "steps": result.steps,
+                            "status": result.status,
+                            "errors": result.errors,
+                            "wiring": result.wiring,
                             "content": result.final_output.get("content", result.final_output),
+                            "finalOutput": result.final_output,
+                            "message": (
+                                result.errors[0].get("message")
+                                if result.status == "failed" and result.errors
+                                else None
+                            ),
+                            "diagnosis": (
+                                result.errors[0].get("diagnosis")
+                                if result.status == "failed" and result.errors
+                                else None
+                            ),
                         },
                         execution_id=trace_id,
                     )
@@ -117,6 +162,9 @@ class Orchestrator:
                     session_id=request.session_id,
                     org_id=org_id,
                     namespace_id=namespace_id,
+                    principal=principal,
+                    environment=environment,
+                    policy_engine=self.policy_engine,
                 )
                 if request.stream:
                     async def _wrap():
@@ -137,6 +185,9 @@ class Orchestrator:
                     org_id=org_id,
                     namespace_id=namespace_id,
                     stream=request.stream,
+                    principal=principal,
+                    environment=environment,
+                    policy_engine=self.policy_engine,
                 )
                 if request.stream:
                     return result

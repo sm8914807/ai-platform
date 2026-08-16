@@ -963,6 +963,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         env = environment or settings.default_env
         config, ns_id = await _resolve_mcp_config(st, namespace, env, body.tool_ref, body.config)
         tool_name = body.tool_name or config.get("toolName") or config.get("tool") or "tool"
+        tool_resource = body.tool_ref or f"tools/{tool_name}"
+        published = await st.registry.list_published(ns_id)
+        st.policy_engine.load_from_bundle(_bundle_index(published))
+        from ai_platform.core.models import PolicyContext
+
+        decision = st.policy_engine.evaluate(
+            PolicyContext(
+                principal=_auth_principal(request, st),
+                action="tool:invoke",
+                resource=tool_resource if str(tool_resource).startswith("tools/") else f"tools/{tool_resource}",
+                environment=env,
+                org_id=namespace.split("/", 1)[0],
+            )
+        )
+        if not decision.allowed:
+            raise HTTPException(
+                403,
+                detail={
+                    "message": "policy denied",
+                    "reason": decision.reason,
+                    "matchedRule": decision.matched_rule,
+                    "action": "tool:invoke",
+                    "diagnosis": "A published Policy denied this MCP tool call.",
+                },
+            )
         spec = ToolSpec(
             adapter="mcp",
             manifest=ToolManifest(name=str(tool_name), inputSchema={}, outputSchema={}),
@@ -1027,6 +1052,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 org_id=namespace.split("/", 1)[0],
                 namespace_id=ns_id,
                 multi_agent=bool(body.get("multiAgent") or body.get("multi_agent")),
+                collaboration=body.get("collaboration"),
             )
         if hasattr(result, "model_dump"):
             return result.model_dump(mode="json")

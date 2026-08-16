@@ -222,7 +222,7 @@ export function AgentGraph({ resources }: { resources: Resource[] }) {
   );
 }
 
-function collaborationNodes(
+export function collaborationNodes(
   pattern: string,
   agents?: Record<string, string>,
 ): FlowNode[] {
@@ -249,9 +249,58 @@ function collaborationNodes(
       },
     ];
   }
+  if (pattern === "hierarchical" || pattern === "supervisor_workers") {
+    const workers = Object.entries(agents ?? {}).filter(
+      ([k]) => k === "worker" || k.startsWith("worker"),
+    );
+    return [
+      {
+        id: "s",
+        label: "supervisor",
+        sub: agents?.supervisor ?? "agents/supervisor",
+        kind: "agent",
+      },
+      ...(workers.length
+        ? workers.map(([role, ref], i) => ({
+            id: `w${i}`,
+            label: role,
+            sub: ref,
+            kind: "agent" as const,
+          }))
+        : [
+            {
+              id: "w0",
+              label: "worker",
+              sub: agents?.worker ?? "agents/worker",
+              kind: "agent" as const,
+            },
+          ]),
+    ];
+  }
+  if (pattern === "peer_round_robin") {
+    const peers = Object.entries(agents ?? {});
+    if (!peers.length) {
+      return [{ id: "peer", label: "peer", sub: "agents/peer-agent", kind: "agent" }];
+    }
+    return peers.map(([role, ref], i) => ({
+      id: `peer${i}`,
+      label: role,
+      sub: ref,
+      kind: "agent" as const,
+      note: i === 0 ? "round-robin" : undefined,
+    }));
+  }
   return [
     { id: "pat", label: pattern, kind: "workflow", sub: "pattern" },
   ];
+}
+
+export function collaborationRoles(pattern: string): string[] {
+  if (pattern === "planner_executor_reviewer") return ["planner", "executor", "reviewer"];
+  if (pattern === "hierarchical" || pattern === "supervisor_workers")
+    return ["supervisor", "worker"];
+  if (pattern === "peer_round_robin") return ["peer"];
+  return [];
 }
 
 export function MessagingGraph({

@@ -66,6 +66,9 @@ class WorkflowEngine:
         namespace_id: str,
         workflow_version_id: str = "local",
         stream: bool = False,
+        principal: str = "anonymous",
+        environment: str = "development",
+        policy_engine: Any | None = None,
     ) -> AsyncIterator[ExecutionEvent] | WorkflowRunState:
         workflow_doc = self._resolve(bundle, workflow_ref)
         if not workflow_doc:
@@ -101,7 +104,16 @@ class WorkflowEngine:
                 )
 
                 try:
-                    output = await self._run_step(bundle, step, state, org_id, namespace_id)
+                    output = await self._run_step(
+                        bundle,
+                        step,
+                        state,
+                        org_id,
+                        namespace_id,
+                        principal=principal,
+                        environment=environment,
+                        policy_engine=policy_engine,
+                    )
                     state.steps[step.id] = output
                     await self.state_store.record_step(
                         run_id, step.id, "completed", state.input, output
@@ -158,6 +170,9 @@ class WorkflowEngine:
         org_id: str,
         namespace_id: str,
         skip_quota: bool = False,
+        principal: str = "anonymous",
+        environment: str = "development",
+        policy_engine: Any | None = None,
     ) -> dict[str, Any]:
         step_input = {**state.input, **state.steps}
         if skip_quota:
@@ -171,6 +186,9 @@ class WorkflowEngine:
                 stream=False,
                 org_id=org_id,
                 namespace_id=namespace_id,
+                principal=principal,
+                environment=environment,
+                policy_engine=policy_engine,
             )
             if isinstance(result, ExecutionEvent) and result.type == "done":
                 return {"status": "ok", "output": result.data}
@@ -189,6 +207,23 @@ class WorkflowEngine:
             if not tool_doc:
                 raise ValueError(f"Tool not found: {step.ref}")
             tool_spec = ToolSpec.model_validate(tool_doc["spec"])
+            if policy_engine is not None:
+                from ai_platform.core.models import PolicyContext
+
+                decision = policy_engine.evaluate(
+                    PolicyContext(
+                        principal=principal,
+                        action="tool:invoke",
+                        resource=step.ref,
+                        environment=environment,
+                        org_id=org_id,
+                    )
+                )
+                if not decision.allowed:
+                    raise RuntimeError(
+                        f"policy denied: {decision.reason}"
+                        + (f" ({decision.matched_rule})" if decision.matched_rule else "")
+                    )
             rate_limit, _require_approval = quota_for_tool(bundle, step.ref)
             quota = rate_limit or tool_spec.rate_limit
             if not skip_quota:
@@ -216,7 +251,16 @@ class WorkflowEngine:
             branches = step.branches or []
             results = await asyncio.gather(
                 *[
-                    self._run_branch(bundle, branch, state, org_id, namespace_id)
+                    self._run_branch(
+                        bundle,
+                        branch,
+                        state,
+                        org_id,
+                        namespace_id,
+                        principal=principal,
+                        environment=environment,
+                        policy_engine=policy_engine,
+                    )
                     for branch in branches
                 ]
             )
@@ -235,13 +279,25 @@ class WorkflowEngine:
         state: WorkflowRunState,
         org_id: str,
         namespace_id: str,
+        principal: str = "anonymous",
+        environment: str = "development",
+        policy_engine: Any | None = None,
     ) -> dict[str, Any]:
         branch_step = WorkflowStep(
             id=branch.get("id", new_id("branch")),
             type=branch["type"],
             ref=branch.get("ref"),
         )
-        return await self._run_step(bundle, branch_step, state, org_id, namespace_id)
+        return await self._run_step(
+            bundle,
+            branch_step,
+            state,
+            org_id,
+            namespace_id,
+            principal=principal,
+            environment=environment,
+            policy_engine=policy_engine,
+        )
 
     async def approve(self, run_id: str, decision: str = "approved") -> WorkflowRunState:
         state = await self.state_store.load_checkpoint(run_id)
