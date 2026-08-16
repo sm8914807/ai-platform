@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +27,39 @@ def normalize_postgres_url(url: str) -> str:
     return url
 
 
+_PG_SHORT_OFFSET = re.compile(r"([+-]\d{2})$")
+
+
+def _encode_timestamp(value: Any) -> str:
+    """Stores write ISO-8601 strings; asyncpg wants datetimes — send text either way."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _decode_timestamp(value: str) -> Any:
+    text = value.strip().replace(" ", "T", 1)
+    if _PG_SHORT_OFFSET.search(text):
+        text += ":00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return value
+
+
+async def _init_connection(conn: Any) -> None:
+    for typename in ("timestamptz", "timestamp"):
+        await conn.set_type_codec(
+            typename,
+            schema="pg_catalog",
+            encoder=_encode_timestamp,
+            decoder=_decode_timestamp,
+            format="text",
+        )
+
+
 class PgPool:
     """Thin asyncpg pool wrapper."""
 
@@ -36,7 +71,9 @@ class PgPool:
         if self._pool is None:
             import asyncpg
 
-            self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
+            self._pool = await asyncpg.create_pool(
+                self.dsn, min_size=1, max_size=10, init=_init_connection
+            )
         return self._pool
 
     async def close(self) -> None:

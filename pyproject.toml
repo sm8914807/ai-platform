@@ -47,7 +47,7 @@ dev = [
 ]
 
 [project.scripts]
-platform-api = "ai_platform.api.main:run"
+platform-api = "ai_platform.api.app:run"
 platform = "ai_platform.cli:main"
 
 [tool.pytest.ini_options]

@@ -383,7 +383,7 @@ class AMTPGateway:
                 agent.delivery_mode,
                 agent.push_target,
                 json.dumps(agent.supported_schemas),
-                1 if agent.active else 0,
+                bool(agent.active),
                 json.dumps(agent.metadata),
                 existing["id"],
             )
@@ -400,7 +400,7 @@ class AMTPGateway:
                 agent.delivery_mode,
                 agent.push_target,
                 json.dumps(agent.supported_schemas),
-                1 if agent.active else 0,
+                bool(agent.active),
                 json.dumps(agent.metadata),
                 now,
             )
