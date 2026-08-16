@@ -139,13 +139,15 @@ class ModelRouteSpec(BaseModel):
 
 class AuditEvent(BaseModel):
     id: str
-    org_id: str
-    actor_id: str | None = None
+    org_id: str = Field(alias="orgId")
+    actor_id: str | None = Field(default=None, alias="actorId")
     action: str
-    resource_ref: str | None = None
+    resource_ref: str | None = Field(default=None, alias="resourceRef")
     payload: dict[str, Any] = Field(default_factory=dict)
     ip: str | None = None
-    created_at: datetime
+    created_at: datetime = Field(alias="createdAt")
+
+    model_config = {"populate_by_name": True}
 
 
 class PlatformEvent(BaseModel):

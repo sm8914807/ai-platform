@@ -139,6 +139,20 @@ class InMemoryRegistryStore(RegistryStore):
         self._audit.append(event)
         return event
 
+    async def list_audit(
+        self,
+        org_id: str,
+        *,
+        limit: int = 50,
+        action: str | None = None,
+    ) -> list[AuditEvent]:
+        lim = max(1, min(int(limit), 200))
+        rows = [e for e in self._audit if e.org_id == org_id]
+        if action:
+            rows = [e for e in rows if e.action == action]
+        rows.sort(key=lambda e: e.created_at, reverse=True)
+        return rows[:lim]
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

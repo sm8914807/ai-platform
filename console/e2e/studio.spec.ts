@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { seedHitlWorkflow, studioLogin } from "./helpers";
 
 test.describe("Platform Studio", () => {
   test.beforeEach(async ({ page }) => {
@@ -9,15 +10,7 @@ test.describe("Platform Studio", () => {
   });
 
   test("login, overview health, and resources nav", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.getByTestId("login-screen")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-
-    await page.getByTestId("login-email").fill("e2e@example.com");
-    await page.getByTestId("login-org").fill("default-org");
-    await page.getByTestId("login-submit").click();
-
-    await expect(page.getByTestId("studio-app")).toBeVisible({ timeout: 20_000 });
+    await studioLogin(page);
     await expect(page.getByTestId("user-email")).toContainText("e2e@example.com");
     await expect(page.getByTestId("health-version")).not.toHaveText("…", { timeout: 20_000 });
     await expect(page.getByTestId("ns-switcher")).toBeVisible();
@@ -41,7 +34,51 @@ test.describe("Platform Studio", () => {
     await page.getByTestId("nav-hitl").click();
     await expect(page.getByRole("heading", { name: /hitl inbox/i })).toBeVisible();
 
+    await page.getByTestId("nav-identity").click();
+    await expect(page.getByTestId("identity-view")).toBeVisible();
+
+    await page.getByTestId("nav-activity").click();
+    await expect(page.getByRole("heading", { name: /activity/i })).toBeVisible();
+
     await page.getByTestId("sign-out").click();
     await expect(page.getByTestId("login-screen")).toBeVisible();
+  });
+
+  test("SCIM identity: create and deactivate user", async ({ page }) => {
+    await studioLogin(page, "scim-admin@example.com");
+    await page.getByTestId("nav-identity").click();
+    await expect(page.getByTestId("identity-view")).toBeVisible();
+
+    const email = `scim-e2e-${Date.now()}@example.com`;
+    await page.getByTestId("identity-email").fill(email);
+    await page.getByTestId("identity-display-name").fill("SCIM E2E");
+    await page.getByTestId("identity-create").click();
+
+    await expect(page.getByText(email).first()).toBeVisible({ timeout: 15_000 });
+    const row = page.locator(".list-item", { hasText: email });
+    await expect(row.getByText("active")).toBeVisible();
+    await row.getByRole("button", { name: /deactivate/i }).click();
+    await expect(row.getByText("inactive")).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("HITL inbox: approve and resume paused workflow", async ({ page, request }) => {
+    const token = await studioLogin(page, "hitl-e2e@example.com");
+    const suffix = String(Date.now()).slice(-8);
+    const { runId, started } = await seedHitlWorkflow(request, token, suffix);
+    expect(started.status).toBe("waiting_approval");
+    expect(runId).toBeTruthy();
+
+    await page.getByTestId("nav-hitl").click();
+    await expect(page.getByRole("heading", { name: /hitl inbox/i })).toBeVisible();
+    await page.getByRole("button", { name: /refresh/i }).click();
+
+    const item = page.getByTestId(`hitl-run-${runId}`);
+    await expect(item).toBeVisible({ timeout: 15_000 });
+    await item.click();
+    await page.getByTestId("hitl-approve").click();
+
+    await expect(page.locator(".code")).toContainText(/completed|approved/i, {
+      timeout: 20_000,
+    });
   });
 });

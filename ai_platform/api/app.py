@@ -190,6 +190,32 @@ def _auth_principal(request: Request, st: AppState) -> str:
     return "anonymous"
 
 
+async def _record_audit(
+    st: AppState,
+    *,
+    org_id: str,
+    action: str,
+    actor_id: str | None = None,
+    resource_ref: str | None = None,
+    payload: dict[str, Any] | None = None,
+    ip: str | None = None,
+) -> None:
+    from ai_platform.core.models import AuditEvent
+
+    await st.registry.append_audit(
+        AuditEvent(
+            id=new_id("audit"),
+            org_id=org_id,
+            actor_id=actor_id,
+            action=action,
+            resource_ref=resource_ref,
+            payload=payload or {},
+            ip=ip,
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+
+
 def _is_public_path(path: str) -> bool:
     if path in {
         "/health",
@@ -248,7 +274,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     import os
 
+    from ai_platform.api.prod_checks import assert_production_ready
     from ai_platform.db.backend import database_url, is_postgres
+
+    assert_production_ready(settings)
 
     dsn = settings.database_url or database_url() or os.getenv("DATABASE_URL")
     backend = "postgres" if is_postgres(dsn) else "sqlite"
@@ -289,6 +318,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sql=sql,
             database_url=dsn,
             redis_url=settings.redis_url,
+            governor_backend=settings.governor_backend,
             auth_secret=settings.auth_secret,
             auth_required=settings.auth_required,
             planner_mode=settings.planner_mode,
@@ -368,6 +398,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "registryBackend": st.backend if st else backend,
             "sqlBackend": st.sql.kind if st else backend,
             "federationDomain": settings.federation_domain,
+            "env": settings.env,
+            "governorBackend": (
+                st.tool_governor.backend if st else settings.governor_backend
+            ),
+            "authRequired": settings.auth_required,
+            "devLoginEnabled": settings.allow_dev_login,
             "tracing": tracing_status(),
             "otlpEndpointConfigured": bool(settings.otlp_endpoint),
         }
@@ -560,6 +596,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(value, str) or not value:
             raise HTTPException(400, "value is required")
         meta = await st.secrets.put(ns_id, name, value, body.get("metadata"))
+        await _record_audit(
+            st,
+            org_id=namespace.split("/", 1)[0],
+            action="secret.put",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"secrets/{name}",
+            payload={"namespace": namespace},
+            ip=request.client.host if request.client else None,
+        )
         return meta.model_dump(mode="json")
 
     @app.get("/v1/{namespace:path}/secrets")
@@ -1004,7 +1049,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def execute_resource(
         namespace: str, body: dict, request: Request, environment: str | None = None
     ):
-        """Run a published agent once (used by Studio's in-editor test runner)."""
+        """Run a published agent or workflow once (Studio test runner / HITL seed)."""
         from ai_platform.core.models import ExecutionRequest
         from ai_platform.orchestrator.engine import Orchestrator
         from ai_platform.telemetry.tracing import get_tracer
@@ -1025,8 +1070,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "stream": False,
             }
         )
-        if not execution.resource_ref.startswith("agents/"):
-            raise HTTPException(400, detail="Studio test execution currently supports agents only")
+        if not (
+            execution.resource_ref.startswith("agents/")
+            or execution.resource_ref.startswith("workflows/")
+        ):
+            raise HTTPException(
+                400,
+                detail="Studio execution supports agents/ and workflows/ refs only",
+            )
         published = await st.registry.list_published(ns_id)
         bundle = _bundle_index(published)
         orchestrator = Orchestrator(
@@ -1135,6 +1186,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for v in published
                 if v.kind and v.name
             ]
+        }
+
+    @app.get("/v1/{namespace:path}/audit")
+    async def list_audit_events(
+        namespace: str,
+        request: Request,
+        limit: int = 50,
+        action: str | None = None,
+    ):
+        """Org-scoped activity log (publish, login, secrets, promotions)."""
+        st = state(request)
+        _ = await st.registry.ensure_namespace(namespace, settings.default_env)
+        org_id = namespace.split("/", 1)[0]
+        events = await st.registry.list_audit(
+            org_id, limit=min(max(limit, 1), 200), action=action
+        )
+        return {
+            "orgId": org_id,
+            "events": [e.model_dump(mode="json", by_alias=True) for e in events],
+            "count": len(events),
         }
 
     @app.get("/v1/regions")
@@ -1255,9 +1326,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def login(body: LoginBody, request: Request):
         st = state(request)
         try:
-            return await st.sso_service.login(body.org_id, body.email, body.display_name)
+            result = await st.sso_service.login(body.org_id, body.email, body.display_name)
         except PermissionError as e:
             raise HTTPException(403, detail=str(e)) from e
+        user = result.get("user") or {}
+        await _record_audit(
+            st,
+            org_id=body.org_id,
+            action="auth.login",
+            actor_id=user.get("id") or body.email,
+            resource_ref=f"users/{body.email}",
+            payload={"provider": result.get("provider") or "dev"},
+            ip=request.client.host if request.client else None,
+        )
+        return result
 
     @app.post("/v1/auth/oidc/start")
     async def oidc_start(body: OidcStartBody, request: Request):
@@ -1279,7 +1361,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from ai_platform.auth.oidc_provider import OidcProviderError
 
         try:
-            return await st.sso_service.complete_oidc(
+            result = await st.sso_service.complete_oidc(
                 code=body.code,
                 state=body.state,
                 code_verifier=body.code_verifier,
@@ -1287,6 +1369,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except OidcProviderError as e:
             raise HTTPException(400, detail=str(e)) from e
+        user = result.get("user") or {}
+        org_id = body.org_id or settings.default_namespace.split("/", 1)[0]
+        await _record_audit(
+            st,
+            org_id=org_id,
+            action="auth.login",
+            actor_id=user.get("id") or user.get("email"),
+            resource_ref=f"users/{user.get('email') or 'oidc'}",
+            payload={"provider": result.get("provider") or "oidc"},
+            ip=request.client.host if request.client else None,
+        )
+        return result
 
     @app.get("/v1/marketplace/plugins")
     async def list_marketplace_plugins(request: Request, tier: str | None = None):
@@ -1647,6 +1741,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"promotionId": promo_id, "status": "pending_approval"}
         await st.promotion_service.approve_promotion(promo_id, body.requested_by)
         count = await st.promotion_service.promote_resources(namespace, body.from_env, body.to_env)
+        await _record_audit(
+            st,
+            org_id=namespace.split("/", 1)[0],
+            action="environment.promoted",
+            actor_id=body.requested_by or _auth_principal(request, st),
+            resource_ref=namespace,
+            payload={
+                "fromEnv": body.from_env,
+                "toEnv": body.to_env,
+                "resourcesPromoted": count,
+            },
+            ip=request.client.host if request.client else None,
+        )
         return {"promotionId": promo_id, "status": "completed", "resourcesPromoted": count}
 
     @app.post("/v1/promotions/{promo_id}/approve")

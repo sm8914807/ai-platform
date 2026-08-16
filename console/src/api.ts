@@ -148,6 +148,34 @@ export type Health = {
   registryBackend?: string;
   sqlBackend?: string;
   federationDomain?: string;
+  env?: string;
+  governorBackend?: string;
+  authRequired?: boolean;
+  devLoginEnabled?: boolean;
+};
+
+export type AuditEvent = {
+  id: string;
+  orgId?: string;
+  org_id?: string;
+  actorId?: string | null;
+  actor_id?: string | null;
+  action: string;
+  resourceRef?: string | null;
+  resource_ref?: string | null;
+  payload?: Record<string, unknown>;
+  ip?: string | null;
+  createdAt?: string;
+  created_at?: string;
+};
+
+export type ScimUser = {
+  id: string;
+  userName: string;
+  name?: { formatted?: string };
+  emails?: Array<{ value: string; primary?: boolean }>;
+  active?: boolean;
+  externalId?: string | null;
 };
 
 export type MarketplacePlugin = {
@@ -484,6 +512,37 @@ export const api = {
       `/v1/workflows/inbox?${q.toString()}`,
     );
   },
+  listAudit: (ns = DEFAULT_NS, limit = 50, action?: string) => {
+    const q = new URLSearchParams({ limit: String(limit) });
+    if (action) q.set("action", action);
+    return request<{ orgId: string; events: AuditEvent[]; count: number }>(
+      `/v1/${ns}/audit?${q.toString()}`,
+    );
+  },
+  scimListUsers: (orgId = "default-org") =>
+    request<{
+      schemas: string[];
+      totalResults: number;
+      Resources: ScimUser[];
+    }>(`/scim/v2/Users?org_id=${encodeURIComponent(orgId)}`),
+  scimCreateUser: (
+    orgId: string,
+    body: {
+      userName: string;
+      name?: { formatted?: string };
+      emails?: Array<{ value: string; primary?: boolean }>;
+      active?: boolean;
+      externalId?: string;
+    },
+  ) =>
+    request<ScimUser>(`/scim/v2/Users?org_id=${encodeURIComponent(orgId)}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  scimDeactivateUser: (userId: string) =>
+    request<{ deleted: boolean }>(`/scim/v2/Users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    }),
   getWorkflowRun: (runId: string) =>
     request<HitlInboxItem & { output?: Record<string, unknown>; checkpointSeq?: number }>(
       `/v1/workflows/runs/${encodeURIComponent(runId)}`,

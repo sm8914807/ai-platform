@@ -24,6 +24,8 @@ import {
   type Resource,
   type SecretMeta,
   type Trace,
+  type AuditEvent,
+  type ScimUser,
 } from "./api";
 import {
   AgentGraph,
@@ -64,7 +66,9 @@ type View =
   | "git"
   | "terraform"
   | "regions"
-  | "hitl";
+  | "hitl"
+  | "activity"
+  | "identity";
 
 const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
   {
@@ -91,6 +95,8 @@ const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
   {
     label: "Ops",
     items: [
+      { id: "activity", label: "Activity" },
+      { id: "identity", label: "Identity (SCIM)" },
       { id: "metrics", label: "Metrics" },
       { id: "evaluations", label: "Evaluations" },
       { id: "regions", label: "Regions & edge" },
@@ -317,6 +323,8 @@ export default function App() {
           {view === "collaboration" && <CollaborationView ns={ns} onError={setError} />}
           {view === "messaging" && <MessagingView ns={ns} onError={setError} />}
           {view === "hitl" && <HitlInboxView ns={ns} onError={setError} />}
+          {view === "activity" && <ActivityView ns={ns} onError={setError} />}
+          {view === "identity" && <IdentityView ns={ns} onError={setError} />}
           {view === "secrets" && <SecretsView ns={ns} onError={setError} />}
           {view === "federation" && <FederationView ns={ns} onError={setError} />}
           {view === "compliance" && <ComplianceView ns={ns} user={user} onError={setError} />}
@@ -3127,7 +3135,11 @@ function HitlInboxView({ ns, onError }: { ns: string; onError: (e: string) => vo
                 >
                   {busy ? "Working…" : "Approve & resume"}
                 </button>
-                <button disabled={busy} onClick={() => void act("rejected")}>
+                <button
+                  disabled={busy}
+                  data-testid="hitl-reject"
+                  onClick={() => void act("rejected")}
+                >
                   Reject
                 </button>
               </div>
@@ -3400,6 +3412,266 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
       </div>
 
       {result && <pre className="code" style={{ marginTop: "1rem" }}>{result}</pre>}
+    </section>
+  );
+}
+
+function IdentityView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const orgId = ns.split("/")[0] || "default-org";
+  const [users, setUsers] = useState<ScimUser[]>([]);
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.scimListUsers(orgId);
+      setUsers(r.Resources || []);
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }, [orgId, onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function createUser() {
+    if (!email.trim()) return;
+    setBusy(true);
+    setNotice(null);
+    try {
+      await api.scimCreateUser(orgId, {
+        userName: email.trim(),
+        name: { formatted: displayName.trim() || email.trim() },
+        emails: [{ value: email.trim(), primary: true }],
+        active: true,
+      });
+      setEmail("");
+      setDisplayName("");
+      setNotice(`Created ${email.trim()}`);
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deactivate(user: ScimUser) {
+    setBusy(true);
+    setNotice(null);
+    try {
+      await api.scimDeactivateUser(user.id);
+      setNotice(`Deactivated ${user.userName}`);
+      await load();
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const activeCount = users.filter((u) => u.active !== false).length;
+
+  return (
+    <section data-testid="identity-view">
+      <header className="page-header row">
+        <div>
+          <h1>Identity (SCIM)</h1>
+          <p className="muted">
+            Org users via <span className="mono">/scim/v2/Users</span> for{" "}
+            <span className="mono">{orgId}</span>. Deactivate soft-disables the account.
+          </p>
+        </div>
+        <button onClick={() => void load()}>Refresh</button>
+      </header>
+
+      <div className="metric-grid" style={{ marginBottom: "1rem" }}>
+        <div className="metric-card">
+          <div className="metric-label">Users</div>
+          <div className="metric-value" data-testid="identity-user-count">
+            {users.length}
+          </div>
+          <div className="muted">{activeCount} active</div>
+        </div>
+      </div>
+
+      <div className="panel secret-create-panel" style={{ marginBottom: "1rem" }}>
+        <div>
+          <h2>Create user</h2>
+          <p className="muted">SCIM User create — email is the userName.</p>
+        </div>
+        <div className="form-row secret-form-row">
+          <label className="form-field">
+            <span className="form-label">Email</span>
+            <input
+              data-testid="identity-email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="user@example.com"
+            />
+          </label>
+          <label className="form-field">
+            <span className="form-label">Display name</span>
+            <input
+              data-testid="identity-display-name"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="Optional"
+            />
+          </label>
+          <button
+            className="primary"
+            disabled={busy || !email.trim()}
+            data-testid="identity-create"
+            onClick={() => void createUser()}
+          >
+            {busy ? "Saving…" : "Create"}
+          </button>
+        </div>
+        {notice && <p className="muted">{notice}</p>}
+      </div>
+
+      <div className="panel list">
+        <div className="form-section-title">Directory</div>
+        {users.length === 0 ? (
+          <p className="muted" style={{ padding: "0.75rem" }}>
+            No users yet. Create one above or sign in once.
+          </p>
+        ) : (
+          users.map((user) => (
+            <div
+              key={user.id}
+              className="list-item"
+              data-testid={`identity-user-${user.id}`}
+              style={{ cursor: "default" }}
+            >
+              <div>
+                <div className="mono">{user.userName}</div>
+                <div className="muted">
+                  {user.name?.formatted || "—"} ·{" "}
+                  <span className="mono">{user.id}</span>
+                </div>
+              </div>
+              <div className="form-row">
+                <span className={user.active === false ? "badge warn" : "badge ok"}>
+                  {user.active === false ? "inactive" : "active"}
+                </span>
+                {user.active !== false && (
+                  <button
+                    disabled={busy}
+                    data-testid={`identity-deactivate-${user.id}`}
+                    onClick={() => void deactivate(user)}
+                  >
+                    Deactivate
+                  </button>
+                )}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ActivityView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [orgId, setOrgId] = useState("");
+  const [selected, setSelected] = useState<AuditEvent | null>(null);
+  const [filter, setFilter] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.listAudit(ns, 80, filter || undefined);
+      setEvents(r.events);
+      setOrgId(r.orgId);
+      setSelected((prev) => {
+        if (!prev) return null;
+        return r.events.find((e) => e.id === prev.id) ?? null;
+      });
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    }
+  }, [ns, onError, filter]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section>
+      <header className="page-header row">
+        <div>
+          <h1>Activity</h1>
+          <p className="muted">
+            Org audit trail — publishes, logins, secret writes, and promotions for{" "}
+            <span className="mono">{orgId || ns.split("/")[0]}</span>.
+          </p>
+        </div>
+        <div className="form-row">
+          <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+            <option value="">All actions</option>
+            <option value="resource.published">resource.published</option>
+            <option value="auth.login">auth.login</option>
+            <option value="secret.put">secret.put</option>
+            <option value="environment.promoted">environment.promoted</option>
+          </select>
+          <button onClick={() => void load()}>Refresh</button>
+        </div>
+      </header>
+
+      <div className="metric-grid" style={{ marginBottom: "1rem" }}>
+        <div className="metric-card">
+          <div className="metric-label">Events</div>
+          <div className="metric-value">{events.length}</div>
+          <div className="muted mono">{filter || "all"}</div>
+        </div>
+      </div>
+
+      <div className="split">
+        <div className="panel list">
+          <div className="form-section-title">Recent</div>
+          {events.length === 0 ? (
+            <p className="muted" style={{ padding: "0.75rem" }}>
+              No audit events yet. Publish a resource or sign in to create one.
+            </p>
+          ) : (
+            events.map((ev) => {
+              const when = ev.createdAt ?? ev.created_at ?? "";
+              const actor = ev.actorId ?? ev.actor_id ?? "—";
+              const ref = ev.resourceRef ?? ev.resource_ref ?? "—";
+              return (
+                <button
+                  key={ev.id}
+                  className={selected?.id === ev.id ? "list-item active" : "list-item"}
+                  onClick={() => setSelected(ev)}
+                >
+                  <div className="row" style={{ justifyContent: "space-between", gap: "0.5rem" }}>
+                    <strong className="mono">{ev.action}</strong>
+                    <span className="muted mono" style={{ fontSize: "0.75rem" }}>
+                      {when ? new Date(when).toLocaleString() : ""}
+                    </span>
+                  </div>
+                  <div className="muted" style={{ fontSize: "0.85rem" }}>
+                    {String(actor)} · {String(ref)}
+                  </div>
+                </button>
+              );
+            })
+          )}
+        </div>
+        <div className="panel">
+          <div className="form-section-title">Detail</div>
+          {selected ? (
+            <pre className="code-block">{JSON.stringify(selected, null, 2)}</pre>
+          ) : (
+            <p className="muted">Select an event.</p>
+          )}
+        </div>
+      </div>
     </section>
   );
 }

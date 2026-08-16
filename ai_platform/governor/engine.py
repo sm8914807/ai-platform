@@ -172,15 +172,40 @@ class ToolGovernor:
         self,
         store: CounterStore | None = None,
         fail_closed: bool = True,
+        *,
+        backend: str = "memory",
     ) -> None:
         self.store = store or MemoryCounterStore()
         self.fail_closed = fail_closed
+        self.backend = backend
 
     @classmethod
     def from_redis_url(cls, url: str | None) -> ToolGovernor:
-        if not url:
-            return cls(MemoryCounterStore(), fail_closed=False)
-        return cls(RedisCounterStore(url), fail_closed=True)
+        return cls.from_config(redis_url=url, backend="auto")
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        redis_url: str | None = None,
+        backend: str = "auto",
+    ) -> ToolGovernor:
+        choice = (backend or "auto").strip().lower()
+        if choice not in {"auto", "memory", "redis"}:
+            raise ValueError(
+                f"invalid governor backend: {backend!r} (expected auto|memory|redis)"
+            )
+        if choice == "memory":
+            return cls(MemoryCounterStore(), fail_closed=False, backend="memory")
+        if choice == "redis":
+            if not redis_url:
+                raise ValueError(
+                    "PLATFORM_GOVERNOR_BACKEND=redis requires PLATFORM_REDIS_URL"
+                )
+            return cls(RedisCounterStore(redis_url), fail_closed=True, backend="redis")
+        if redis_url:
+            return cls(RedisCounterStore(redis_url), fail_closed=True, backend="redis")
+        return cls(MemoryCounterStore(), fail_closed=False, backend="memory")
 
     def key(self, tool_ref: str, org_id: str, namespace_id: str) -> str:
         return f"governor:{org_id}:{namespace_id}:{tool_ref}"

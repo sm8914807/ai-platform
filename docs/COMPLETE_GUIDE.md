@@ -748,6 +748,7 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | Model providers (OpenAI/…) | **Real adapters** | Form yes | Needs keys; mock default |
 | MCP tools | **Real (stdio + HTTP)** | Tool form | Sandboxed; `/v1/.../mcp/list` + `/mcp/call` |
 | **Auth enforced** | **Real (default on)** | Login screen | JWT middleware; set `PLATFORM_AUTH_REQUIRED=false` only for local tests |
+| Production hardening | **Real** | — | `PLATFORM_ENV=production` refuses weak secrets, open dev-login, memory-only governor |
 | Real OIDC (Okta/Azure AD) | **Real** | IdP button | Discovery + PKCE + JWKS; platform session JWT after callback |
 | SCIM secure | **Real when auth on** | None | Same Bearer gate as `/v1` |
 | Identity on Postgres | **Real (SqlBackend)** | Login | Same tables as SQLite; `IdentityStore(sql=…)` |
@@ -757,14 +758,17 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | Git / Terraform UI | **Real** | Yes (Ops → Git sync / Terraform) | Sync/export YAML; TF preview + write |
 | Compliance install UI | **Real** | Yes | Install into namespace |
 | Metrics dashboard | **Real** | Yes (Ops → Metrics) | Summary + routes + Prometheus `/metrics` |
+| Activity / audit log | **Real** | Yes (Ops → Activity) | `GET /v1/{ns}/audit`; login / publish / secrets / promote |
 | OTLP on API | **Real** | — | Lifespan setup/shutdown; HTTP + execute spans; OTLP/HTTP export |
 | Eval judge quality | **Real** | Yes (Ops → Evaluations) | Keyword, latency, tool, LLM judges; publish auto-triggers |
 | Multi-namespace switcher | **Real** | Yes (topbar) | Persist NS; ensure + list APIs |
 | Multi-agent collaboration UI | **Real** | Yes (Build → Multi-agent) | Role wiring + timeline + diagnosis |
 | Resource actions | **Real** | Yes | New / Clone / Edit / Unpublish (not hard-delete) |
 | Knowledge / Memory / Environment / Eval forms | **Real** | Yes | Editor visual forms |
-| CI Postgres + console e2e | **Real** | — | `test-postgres` + `console-e2e` in CI |
+| CI Postgres + console e2e | **Real** | — | `test-postgres` + `console-e2e` (HITL approve/resume, SCIM UI, OIDC login UI) |
 | Regions / edge Studio | **Real** | Yes (Ops → Regions & edge) | Register, primary, failover, edge nodes |
+| Tool governor (multi-instance) | **Real** | — | Redis when `PLATFORM_REDIS_URL` set; `PLATFORM_GOVERNOR_BACKEND=auto\|memory\|redis` |
+| SCIM admin UI | **Real** | Yes (Ops → Identity) | List / create / deactivate via `/scim/v2/Users` |
 
 ---
 
@@ -772,11 +776,11 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 
 Ordered by remaining leverage:
 
-1. Production auth/ops hardening (require secrets key, disable dev login in prod checks).
-2. Hard resource delete (optional); SCIM admin UI; richer e2e (HITL/OIDC).
-3. Audit/activity log in Studio; Redis-backed governor for multi-instance.
+1. Hard resource delete (optional) — skipped by product choice.
+2. More audit producers (unpublish, MCP call, execute) and retention policies.
+3. Managed Redis / OIDC examples for a one-command SaaS deploy profile.
 
-**Recently shipped:** deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
+**Recently shipped:** SCIM Identity Studio UI; richer HITL + OIDC Playwright e2e; production auth/ops hardening; Redis multi-instance governor; Studio Activity / audit log; deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
 
 ---
 

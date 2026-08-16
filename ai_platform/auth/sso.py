@@ -129,7 +129,7 @@ class SsoService:
         mode = "oidc" if self.oidc_enabled else "dev"
         cfg: dict[str, Any] = {
             "mode": mode,
-            "devLoginEnabled": self.allow_dev_login or not self.oidc_enabled,
+            "devLoginEnabled": bool(self.allow_dev_login),
             "defaultOrgId": self.default_org_id,
         }
         if self.oidc_enabled and self.oidc_provider:
@@ -139,7 +139,7 @@ class SsoService:
     async def login(
         self, org_id: str, email: str, display_name: str | None = None
     ) -> dict[str, Any]:
-        if self.oidc_enabled and not self.allow_dev_login:
+        if not self.allow_dev_login:
             raise PermissionError(
                 "Dev email login disabled; use OIDC (Okta / Azure AD) sign-in"
             )

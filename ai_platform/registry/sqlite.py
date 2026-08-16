@@ -291,6 +291,54 @@ class SqliteRegistryStore(RegistryStore):
         await conn.close()
         return event
 
+    async def list_audit(
+        self,
+        org_id: str,
+        *,
+        limit: int = 50,
+        action: str | None = None,
+    ) -> list[AuditEvent]:
+        conn = await self._connect()
+        conn.row_factory = aiosqlite.Row
+        lim = max(1, min(int(limit), 200))
+        if action:
+            rows = await conn.execute_fetchall(
+                "SELECT * FROM audit_events WHERE org_id = ? AND action = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (org_id, action, lim),
+            )
+        else:
+            rows = await conn.execute_fetchall(
+                "SELECT * FROM audit_events WHERE org_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (org_id, lim),
+            )
+        await conn.close()
+        out: list[AuditEvent] = []
+        for row in rows:
+            created = row["created_at"]
+            if isinstance(created, str):
+                created = datetime.fromisoformat(created)
+            payload = row["payload_json"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload) if payload else {}
+                except json.JSONDecodeError:
+                    payload = {}
+            out.append(
+                AuditEvent(
+                    id=row["id"],
+                    org_id=row["org_id"],
+                    actor_id=row["actor_id"],
+                    action=row["action"],
+                    resource_ref=row["resource_ref"],
+                    payload=payload if isinstance(payload, dict) else {},
+                    ip=row["ip"],
+                    created_at=created,
+                )
+            )
+        return out
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

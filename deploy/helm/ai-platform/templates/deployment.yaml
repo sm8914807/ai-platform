@@ -28,10 +28,42 @@ spec:
           env:
             - name: PLATFORM_DB_PATH
               value: /data/registry.db
+            - name: PLATFORM_ENV
+              value: {{ .Values.env.PLATFORM_ENV | quote }}
             - name: PLATFORM_DEFAULT_NAMESPACE
               value: {{ .Values.env.PLATFORM_DEFAULT_NAMESPACE | quote }}
             - name: PLATFORM_PRIMARY_REGION
               value: {{ .Values.env.PLATFORM_PRIMARY_REGION | quote }}
+            - name: PLATFORM_ALLOW_DEV_LOGIN
+              value: {{ .Values.env.PLATFORM_ALLOW_DEV_LOGIN | quote }}
+            - name: PLATFORM_AUTH_REQUIRED
+              value: {{ .Values.env.PLATFORM_AUTH_REQUIRED | quote }}
+            - name: PLATFORM_GOVERNOR_BACKEND
+              value: {{ .Values.env.PLATFORM_GOVERNOR_BACKEND | quote }}
+            - name: PLATFORM_REDIS_URL
+              value: {{ .Values.env.PLATFORM_REDIS_URL | quote }}
+            - name: PLATFORM_OIDC_ISSUER
+              value: {{ .Values.env.PLATFORM_OIDC_ISSUER | quote }}
+            - name: PLATFORM_OIDC_CLIENT_ID
+              value: {{ .Values.env.PLATFORM_OIDC_CLIENT_ID | quote }}
+            - name: PLATFORM_OIDC_REDIRECT_URI
+              value: {{ .Values.env.PLATFORM_OIDC_REDIRECT_URI | quote }}
+            - name: PLATFORM_SECRETS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ai-platform.fullname" . }}-secrets
+                  key: secrets-key
+            - name: PLATFORM_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ai-platform.fullname" . }}-secrets
+                  key: auth-secret
+            - name: PLATFORM_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ai-platform.fullname" . }}-secrets
+                  key: oidc-client-secret
+                  optional: true
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:

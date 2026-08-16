@@ -2,7 +2,7 @@ replicaCount: 2
 
 image:
   repository: ai-platform
-  tag: "0.6.0"
+  tag: "0.8.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -38,13 +38,24 @@ persistence:
   storageClass: ""
 
 env:
+  PLATFORM_ENV: production
   PLATFORM_DEFAULT_NAMESPACE: default-org/default-project
   PLATFORM_PRIMARY_REGION: us-east-1
+  PLATFORM_ALLOW_DEV_LOGIN: "false"
+  PLATFORM_AUTH_REQUIRED: "true"
+  PLATFORM_GOVERNOR_BACKEND: auto
+  PLATFORM_REDIS_URL: redis://redis:6379/0
+  PLATFORM_OIDC_ISSUER: ""
+  PLATFORM_OIDC_CLIENT_ID: ""
+  PLATFORM_OIDC_REDIRECT_URI: https://platform.local/
 
 secrets:
   openaiApiKey: ""
   anthropicApiKey: ""
   bedrockApiKey: ""
+  secretsKey: ""
+  authSecret: ""
+  oidcClientSecret: ""
 
 serviceAccount:
   create: true

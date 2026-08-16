@@ -13,7 +13,7 @@ COPY schemas ./schemas
 COPY migrations ./migrations
 
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir -e .
+    && pip install --no-cache-dir -e ".[postgres,redis]"
 
 ENV PLATFORM_DB_PATH=/data/registry.db \
     PLATFORM_API_HOST=0.0.0.0 \

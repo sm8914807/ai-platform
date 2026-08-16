@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     api_port: int = 8080
     default_namespace: str = "default-org/default-project"
     default_env: str = "development"
+    # Deployment posture: development | production (aliases: prod).
+    # When production, API refuses weak secrets / open dev-login / memory-only governor.
+    env: str = "development"
     signing_key_pem: str | None = None
     primary_region: str = "us-east-1"
     federation_domain: str = "local.ai-platform"
@@ -21,6 +24,8 @@ class Settings(BaseSettings):
     embedding_provider: str = "auto"  # auto | local | openai
     sandbox_timeout_seconds: float = 30.0
     redis_url: str | None = None
+    # auto | memory | redis — redis requires PLATFORM_REDIS_URL
+    governor_backend: str = "auto"
     planner_mode: str = "auto"  # auto | llm | heuristic
     planner_model_ref: str | None = None
     # When True (default), /v1 and /scim require a Bearer JWT from /v1/auth/login.
@@ -35,7 +40,7 @@ class Settings(BaseSettings):
     oidc_redirect_uri: str = "http://localhost:5173/"
     oidc_scopes: str = "openid profile email"
     oidc_audience: str | None = None
-    # Keep email/password-less HMAC login when OIDC is configured (set false in production).
+    # Email HMAC login (Studio). Must be false when PLATFORM_ENV=production.
     allow_dev_login: bool = True
     # OpenTelemetry / OTLP (HTTP). Example: http://localhost:4318/v1/traces
     otlp_endpoint: str | None = None

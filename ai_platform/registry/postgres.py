@@ -260,6 +260,56 @@ class PostgresRegistryStore(RegistryStore):
         )
         return event
 
+    async def list_audit(
+        self,
+        org_id: str,
+        *,
+        limit: int = 50,
+        action: str | None = None,
+    ) -> list[AuditEvent]:
+        lim = max(1, min(int(limit), 200))
+        if action:
+            rows = await self.pool.fetch(
+                "SELECT * FROM audit_events WHERE org_id = $1 AND action = $2 "
+                "ORDER BY created_at DESC LIMIT $3",
+                org_id,
+                action,
+                lim,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM audit_events WHERE org_id = $1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                org_id,
+                lim,
+            )
+        out: list[AuditEvent] = []
+        for row in rows:
+            created = row["created_at"]
+            if isinstance(created, str):
+                created = datetime.fromisoformat(created)
+            payload = row["payload_json"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload) if payload else {}
+                except json.JSONDecodeError:
+                    payload = {}
+            elif payload is None:
+                payload = {}
+            out.append(
+                AuditEvent(
+                    id=row["id"],
+                    org_id=row["org_id"],
+                    actor_id=row["actor_id"],
+                    action=row["action"],
+                    resource_ref=row["resource_ref"],
+                    payload=payload if isinstance(payload, dict) else {},
+                    ip=row["ip"],
+                    created_at=created,
+                )
+            )
+        return out
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

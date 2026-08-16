@@ -42,6 +42,7 @@ class AppState:
         sql: SqlBackend | None = None,
         database_url: str | None = None,
         redis_url: str | None = None,
+        governor_backend: str = "auto",
         auth_secret: str | None = None,
         auth_required: bool = True,
         planner_mode: str = "auto",
@@ -123,7 +124,9 @@ class AppState:
             secrets=self.secrets,
         )
         self.tool_host = SandboxedToolHost(sandbox=self.tool_sandbox, secrets=self.secrets)
-        self.tool_governor = ToolGovernor.from_redis_url(redis_url)
+        self.tool_governor = ToolGovernor.from_config(
+            redis_url=redis_url, backend=governor_backend
+        )
         from ai_platform.knowledge.service import KnowledgeService
         from ai_platform.memory.service import MemoryService
 

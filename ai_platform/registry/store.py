@@ -123,6 +123,16 @@ class RegistryStore(ABC):
         ...
 
     @abstractmethod
+    async def list_audit(
+        self,
+        org_id: str,
+        *,
+        limit: int = 50,
+        action: str | None = None,
+    ) -> list[AuditEvent]:
+        ...
+
+    @abstractmethod
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:
