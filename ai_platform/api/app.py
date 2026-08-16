@@ -159,7 +159,8 @@ class ScimUserBody(BaseModel):
     schemas: list[str] = Field(default_factory=lambda: ["urn:ietf:params:scim:schemas:core:2.0:User"])
     userName: str
     name: dict[str, str] = Field(default_factory=dict)
-    emails: list[dict[str, str]] = Field(default_factory=list)
+    # SCIM emails carry mixed types (e.g. {"value": str, "primary": bool}).
+    emails: list[dict[str, Any]] = Field(default_factory=list)
     active: bool = True
     externalId: str | None = None
 

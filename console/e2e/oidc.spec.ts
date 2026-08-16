@@ -9,19 +9,12 @@ test.describe("OIDC login UI", () => {
     await page.addInitScript(() => {
       localStorage.removeItem("platform.studio.token");
       localStorage.removeItem("platform.studio.user");
-      // Capture IdP redirect instead of leaving the app.
-      Object.defineProperty(window, "__e2eOidcRedirect", {
-        writable: true,
-        value: null,
-      });
-      const assign = (url: string | URL) => {
-        (window as unknown as { __e2eOidcRedirect: string }).__e2eOidcRedirect = String(url);
-      };
-      try {
-        window.location.assign = assign as typeof window.location.assign;
-      } catch {
-        /* ignore if non-configurable */
-      }
+    });
+
+    // Block the real IdP navigation so the app-origin context (and its
+    // sessionStorage PKCE state) survives for assertions.
+    await page.route(/login\.microsoftonline\.com/, async (route) => {
+      await route.abort();
     });
 
     await page.route("**/v1/auth/config", async (route) => {
@@ -76,8 +69,16 @@ test.describe("OIDC login UI", () => {
     const req = await startReq;
     expect(req.method()).toBe("POST");
 
-    const pending = await page.evaluate(() => sessionStorage.getItem("platform.oidc.pending"));
-    expect(pending).toBeTruthy();
+    // PKCE session is persisted before the (aborted) IdP redirect.
+    await expect
+      .poll(
+        async () => page.evaluate(() => sessionStorage.getItem("platform.oidc.pending")),
+        { timeout: 10_000 },
+      )
+      .not.toBeNull();
+    const pending = await page.evaluate(() =>
+      sessionStorage.getItem("platform.oidc.pending"),
+    );
     const parsed = JSON.parse(String(pending));
     expect(parsed.state).toBe("e2e-state");
     expect(parsed.verifier).toBeTruthy();

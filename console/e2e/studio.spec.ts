@@ -75,6 +75,10 @@ test.describe("Platform Studio", () => {
     const item = page.getByTestId(`hitl-run-${runId}`);
     await expect(item).toBeVisible({ timeout: 15_000 });
     await item.click();
+    // Wait for the run detail to load before approving (openRun is async and
+    // would otherwise overwrite the approve/resume result).
+    await expect(page.locator(".code")).toContainText(runId, { timeout: 15_000 });
+
     await page.getByTestId("hitl-approve").click();
 
     await expect(page.locator(".code")).toContainText(/completed|approved/i, {
