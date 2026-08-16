@@ -94,7 +94,7 @@ async def test_postgres_aux_durable_stores(dsn: str, tmp_path: Path):
             retrieval={"topK": 1},
         ),
     )
-    chunks = await knowledge.retrieve("invoices", [f"knowledgesources/{source}"], {})
+    chunks = await knowledge.store.retrieve("invoices", [source], top_k=1)
     assert chunks
     await sql.close()
 
