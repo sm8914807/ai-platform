@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { seedHitlWorkflow, studioLogin } from "./helpers";
+import { apiJson, seedHitlWorkflow, studioLogin } from "./helpers";
 
 test.describe("Platform Studio", () => {
   test.beforeEach(async ({ page }) => {
@@ -76,13 +76,29 @@ test.describe("Platform Studio", () => {
     await expect(item).toBeVisible({ timeout: 15_000 });
     await item.click();
     // Wait for the run detail to load before approving (openRun is async and
-    // would otherwise overwrite the approve/resume result).
+    // would otherwise race the approve/resume result into the detail pane).
     await expect(page.locator(".code")).toContainText(runId, { timeout: 15_000 });
 
     await page.getByTestId("hitl-approve").click();
 
-    await expect(page.locator(".code")).toContainText(/completed|approved/i, {
-      timeout: 20_000,
-    });
+    // The UI approve triggers approve + resume; confirm the run reaches a
+    // terminal state via the API (deterministic, no detail-pane timing race).
+    await expect
+      .poll(
+        async () => {
+          const run = await apiJson(
+            request,
+            "GET",
+            `/v1/workflows/runs/${encodeURIComponent(runId)}`,
+            token,
+          );
+          return String(run.status ?? "");
+        },
+        { timeout: 20_000 },
+      )
+      .toMatch(/completed/i);
+
+    // The paused run also drops out of the waiting-approval inbox.
+    await expect(page.getByTestId(`hitl-run-${runId}`)).toHaveCount(0, { timeout: 15_000 });
   });
 });

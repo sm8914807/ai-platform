@@ -11,12 +11,6 @@ test.describe("OIDC login UI", () => {
       localStorage.removeItem("platform.studio.user");
     });
 
-    // Block the real IdP navigation so the app-origin context (and its
-    // sessionStorage PKCE state) survives for assertions.
-    await page.route(/login\.microsoftonline\.com/, async (route) => {
-      await route.abort();
-    });
-
     await page.route("**/v1/auth/config", async (route) => {
       await route.fulfill({
         status: 200,
@@ -42,8 +36,9 @@ test.describe("OIDC login UI", () => {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          authorizationUrl:
-            "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize?client_id=e2e",
+          // Same-origin fragment: window.location.assign() performs a pure hash
+          // change so the app JS context (and PKCE sessionStorage) survives.
+          authorizationUrl: "#e2e-oidc-idp",
           state: "e2e-state",
           nonce: "e2e-nonce",
         }),
@@ -69,7 +64,7 @@ test.describe("OIDC login UI", () => {
     const req = await startReq;
     expect(req.method()).toBe("POST");
 
-    // PKCE session is persisted before the (aborted) IdP redirect.
+    // PKCE session is persisted before the same-origin fragment redirect.
     await expect
       .poll(
         async () => page.evaluate(() => sessionStorage.getItem("platform.oidc.pending")),
