@@ -766,9 +766,13 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | Resource actions | **Real** | Yes | New / Clone / Edit / Unpublish (not hard-delete) |
 | Knowledge / Memory / Environment / Eval forms | **Real** | Yes | Editor visual forms |
 | CI Postgres + console e2e | **Real** | — | `test-postgres` + `console-e2e` (HITL approve/resume, SCIM UI, OIDC login UI) |
-| Regions / edge Studio | **Real** | Yes (Ops → Regions & edge) | Register, primary, failover, edge nodes |
+| Regions / edge Studio | **Real** | Yes (Ops → Regions & edge) | Register, primary, failover, edge nodes + telemetry charts |
 | Tool governor (multi-instance) | **Real** | — | Redis when `PLATFORM_REDIS_URL` set; `PLATFORM_GOVERNOR_BACKEND=auto\|memory\|redis` |
 | SCIM admin UI | **Real** | Yes (Ops → Identity) | List / create / deactivate via `/scim/v2/Users` |
+| Multi-agent live streaming | **Real** | Yes (Build → Multi-agent) | SSE `turn` events when `stream: true` |
+| Policy denial UX | **Real** | Banner + diagnosis card | Parses `reason` / `matchedRule` / `diagnosis` |
+| Audit retention | **Real** | Activity → Purge | `PLATFORM_AUDIT_RETENTION_DAYS` (default 90); boot + API purge |
+| One-command SaaS deploy | **Real** | — | `./scripts/saas-up.sh` (Postgres+Redis+API+static Studio) |
 
 ---
 
@@ -777,10 +781,11 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 Ordered by remaining leverage:
 
 1. Hard resource delete (optional) — skipped by product choice.
-2. More audit producers (unpublish, MCP call, execute) and retention policies.
-3. Managed Redis / OIDC examples for a one-command SaaS deploy profile.
+2. Real LLM eval gates in CI (judges exist; CI still mostly mock).
+3. Billing / org invites / usage quotas for full multi-tenant SaaS packaging.
+4. Federation / AMTP production trust + DR runbooks.
 
-**Recently shipped:** SCIM Identity Studio UI; richer HITL + OIDC Playwright e2e; production auth/ops hardening; Redis multi-instance governor; Studio Activity / audit log; deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
+**Recently shipped:** live multi-agent SSE streaming; richer policy “why denied” UX; edge telemetry charts; broader audit producers + retention; one-command SaaS deploy (`scripts/saas-up.sh`); SCIM Identity Studio UI; richer HITL + OIDC Playwright e2e; production auth/ops hardening; Redis multi-instance governor; Studio Activity / audit log; deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
 
 ---
 

@@ -12,6 +12,7 @@ from ai_platform.core.models import RegionConfig
 from ai_platform.db.sql import SqlBackend, create_sql_backend
 
 MIGRATION = Path(__file__).parent.parent.parent / "migrations" / "004_phase4.sql"
+TELEMETRY_MIGRATION = Path(__file__).parent.parent.parent / "migrations" / "007_edge_telemetry.sql"
 
 DEFAULT_REGIONS = [
     {"name": "us-east-1", "endpoint": "http://localhost:8080", "data_residency": "us", "is_primary": True},
@@ -29,6 +30,8 @@ class RegionService:
     async def migrate(self) -> None:
         if self.sql.kind == "sqlite" and MIGRATION.exists():
             await self.sql.migrate_script(MIGRATION.read_text())
+        if self.sql.kind == "sqlite" and TELEMETRY_MIGRATION.exists():
+            await self.sql.migrate_script(TELEMETRY_MIGRATION.read_text())
         await self._seed_defaults()
 
     async def _seed_defaults(self) -> None:
@@ -156,11 +159,137 @@ class RegionService:
         )
         return node_id
 
-    async def record_edge_telemetry(self, node_id: str) -> None:
+    async def record_edge_telemetry(
+        self, node_id: str, events: list[dict[str, Any]] | None = None
+    ) -> int:
         now = datetime.now(timezone.utc).isoformat()
         await self.sql.execute(
-            "UPDATE edge_runtimes SET last_telemetry_at = ? WHERE id = ?", now, node_id
+            "UPDATE edge_runtimes SET last_telemetry_at = ?, status = 'online' WHERE id = ?",
+            now,
+            node_id,
         )
+        rows = events or [{"type": "heartbeat"}]
+        stored = 0
+        for ev in rows:
+            if not isinstance(ev, dict):
+                continue
+            event_id = new_id("telem")
+            latency = ev.get("latencyMs", ev.get("latency_ms"))
+            success = ev.get("success")
+            if success is not None:
+                success = 1 if bool(success) else 0
+            await self.sql.execute(
+                "INSERT INTO edge_telemetry_events "
+                "(id, node_id, event_type, latency_ms, success, payload_json, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                event_id,
+                node_id,
+                str(ev.get("type") or ev.get("eventType") or "heartbeat"),
+                float(latency) if latency is not None else None,
+                success,
+                json.dumps(ev),
+                now,
+            )
+            stored += 1
+        return stored
+
+    async def list_edge_telemetry(
+        self,
+        *,
+        node_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        lim = max(1, min(limit, 500))
+        if node_id:
+            rows = await self.sql.fetchall(
+                "SELECT * FROM edge_telemetry_events WHERE node_id = ? "
+                "ORDER BY recorded_at DESC LIMIT ?",
+                node_id,
+                lim,
+            )
+        else:
+            rows = await self.sql.fetchall(
+                "SELECT * FROM edge_telemetry_events ORDER BY recorded_at DESC LIMIT ?",
+                lim,
+            )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            payload = row.get("payload_json") or "{}"
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload) if payload else {}
+                except json.JSONDecodeError:
+                    payload = {}
+            success = row.get("success")
+            if success is not None:
+                success = bool(success)
+            out.append(
+                {
+                    "id": row["id"],
+                    "nodeId": row["node_id"],
+                    "eventType": row.get("event_type") or "heartbeat",
+                    "latencyMs": row.get("latency_ms"),
+                    "success": success,
+                    "payload": payload if isinstance(payload, dict) else {},
+                    "recordedAt": row.get("recorded_at"),
+                }
+            )
+        return out
+
+    async def telemetry_summary(self, *, hours: int = 24) -> dict[str, Any]:
+        """Aggregate recent telemetry for Studio charts."""
+        events = await self.list_edge_telemetry(limit=500)
+        # Keep newest-first list; chart wants chronological for bars.
+        cutoff = datetime.now(timezone.utc).timestamp() - max(1, hours) * 3600
+        filtered: list[dict[str, Any]] = []
+        for ev in events:
+            raw = ev.get("recordedAt")
+            try:
+                ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                ts = datetime.now(timezone.utc).timestamp()
+            if ts >= cutoff:
+                filtered.append({**ev, "_ts": ts})
+        filtered.sort(key=lambda e: e["_ts"])
+
+        # Bucket into up to 12 time slots.
+        buckets = 12
+        series: list[dict[str, Any]] = []
+        if filtered:
+            start = filtered[0]["_ts"]
+            end = filtered[-1]["_ts"]
+            span = max(end - start, 1.0)
+            slot = span / buckets
+            for i in range(buckets):
+                lo = start + i * slot
+                hi = lo + slot
+                group = [e for e in filtered if lo <= e["_ts"] < hi or (i == buckets - 1 and e["_ts"] <= hi)]
+                latencies = [
+                    float(e["latencyMs"])
+                    for e in group
+                    if e.get("latencyMs") is not None
+                ]
+                ok = sum(1 for e in group if e.get("success") is not False)
+                series.append(
+                    {
+                        "index": i,
+                        "count": len(group),
+                        "successRate": (ok / len(group)) if group else None,
+                        "avgLatencyMs": (
+                            round(sum(latencies) / len(latencies), 2) if latencies else None
+                        ),
+                    }
+                )
+        nodes = await self.list_edge_nodes(limit=200)
+        online = sum(1 for n in nodes if n.get("status") == "online")
+        return {
+            "hours": hours,
+            "eventCount": len(filtered),
+            "nodeCount": len(nodes),
+            "onlineCount": online,
+            "series": series,
+            "recent": [{k: v for k, v in e.items() if k != "_ts"} for e in filtered[-20:]],
+        }
 
     async def list_edge_nodes(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = await self.sql.fetchall(

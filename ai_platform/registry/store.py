@@ -133,6 +133,11 @@ class RegistryStore(ABC):
         ...
 
     @abstractmethod
+    async def purge_audit(self, org_id: str, *, retain_days: int = 90) -> int:
+        """Delete audit rows older than retain_days. Returns deleted count."""
+        ...
+
+    @abstractmethod
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

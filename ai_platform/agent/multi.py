@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ai_platform.agent.engine import AgentEngine
@@ -16,6 +17,8 @@ ROLE_SETS: dict[str, list[str]] = {
     "peer_round_robin": ["peer"],
 }
 
+TurnCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+
 
 class MultiAgentEngine:
     """Compiled multi-agent profiles — not a LangGraph clone."""
@@ -24,8 +27,49 @@ class MultiAgentEngine:
 
     def __init__(self, agent_engine: AgentEngine | None = None) -> None:
         self.agent_engine = agent_engine or AgentEngine()
+        self._on_turn: TurnCallback | None = None
+
+    async def _emit_turn(self, step: dict[str, Any]) -> None:
+        cb = self._on_turn
+        if not cb:
+            return
+        result = cb(step)
+        if result is not None:
+            await result
 
     async def run(
+        self,
+        bundle: dict[str, dict],
+        root_agent_ref: str,
+        input_data: dict[str, Any],
+        collaboration: CollaborationSpec | None = None,
+        session_id: str | None = None,
+        org_id: str = "default",
+        namespace_id: str = "local",
+        principal: str = "anonymous",
+        environment: str = "development",
+        policy_engine: Any | None = None,
+        on_turn: TurnCallback | None = None,
+    ) -> MultiAgentResult:
+        prev_cb = self._on_turn
+        self._on_turn = on_turn
+        try:
+            return await self._run_inner(
+                bundle,
+                root_agent_ref,
+                input_data,
+                collaboration=collaboration,
+                session_id=session_id,
+                org_id=org_id,
+                namespace_id=namespace_id,
+                principal=principal,
+                environment=environment,
+                policy_engine=policy_engine,
+            )
+        finally:
+            self._on_turn = prev_cb
+
+    async def _run_inner(
         self,
         bundle: dict[str, dict],
         root_agent_ref: str,
@@ -99,17 +143,18 @@ class MultiAgentEngine:
                     "ref": root_agent_ref,
                 }
             )
+        step = {
+            "role": "executor",
+            "ref": root_agent_ref,
+            "status": "ok" if status == "completed" else "error",
+            "output": content,
+            "turn": 1,
+        }
+        await self._emit_turn(step)
         return MultiAgentResult(
             pattern="single",
             iterations=1,
-            steps=[
-                {
-                    "role": "executor",
-                    "ref": root_agent_ref,
-                    "status": "ok" if status == "completed" else "error",
-                    "output": content,
-                }
-            ],
+            steps=[step],
             final_output=content if isinstance(content, dict) else {"content": content},
             status=status,  # type: ignore[arg-type]
             errors=errors,
@@ -342,6 +387,7 @@ class MultiAgentEngine:
                 principal, environment, policy_engine,
             )
             steps.append(plan)
+            await self._emit_turn(plan)
             if plan["status"] != "ok":
                 return self._finalize(
                     collab.pattern, i + 1, steps, {}, wiring, stop_status="failed"
@@ -354,6 +400,7 @@ class MultiAgentEngine:
                 principal, environment, policy_engine,
             )
             steps.append(exec_result)
+            await self._emit_turn(exec_result)
             if exec_result["status"] != "ok":
                 return self._finalize(
                     collab.pattern, i + 1, steps, {}, wiring, stop_status="failed"
@@ -368,6 +415,7 @@ class MultiAgentEngine:
                 principal, environment, policy_engine,
             )
             steps.append(review)
+            await self._emit_turn(review)
             if review["status"] != "ok":
                 return self._finalize(
                     collab.pattern, i + 1, steps, exec_result["output"], wiring, stop_status="failed"
@@ -417,6 +465,7 @@ class MultiAgentEngine:
             principal, environment, policy_engine,
         )
         steps.append(route)
+        await self._emit_turn(route)
         if route["status"] != "ok":
             return self._finalize(collab.pattern, 1, steps, {}, wiring, stop_status="failed")
         route_text = str(route["output"].get("content", route["output"]))
@@ -438,6 +487,7 @@ class MultiAgentEngine:
                 policy_engine,
             )
             steps.append(worker)
+            await self._emit_turn(worker)
             if worker["status"] != "ok":
                 return self._finalize(
                     collab.pattern, 1, steps, {}, wiring, stop_status="failed"
@@ -475,6 +525,7 @@ class MultiAgentEngine:
                 principal, environment, policy_engine,
             )
             steps.append(step)
+            await self._emit_turn(step)
             if step["status"] != "ok":
                 return self._finalize(
                     collab.pattern, i + 1, steps, {}, wiring, stop_status="failed"

@@ -341,6 +341,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await app.state.platform.message_bus.migrate()
         await app.state.platform.secrets.migrate()
         await app.state.platform.git_sync.migrate()
+        # Best-effort audit retention on boot (org = default namespace prefix).
+        try:
+            org_id = settings.default_namespace.split("/", 1)[0]
+            await registry.purge_audit(
+                org_id, retain_days=settings.audit_retention_days
+            )
+        except Exception:  # noqa: BLE001 — never block boot on retention
+            pass
         try:
             yield
         finally:
@@ -1024,6 +1032,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         )
         if not decision.allowed:
+            await _record_audit(
+                st,
+                org_id=namespace.split("/", 1)[0],
+                action="policy.denied",
+                actor_id=_auth_principal(request, st),
+                resource_ref=str(tool_resource),
+                payload={
+                    "reason": decision.reason,
+                    "matchedRule": decision.matched_rule,
+                    "action": "tool:invoke",
+                },
+                ip=request.client.host if request.client else None,
+            )
             raise HTTPException(
                 403,
                 detail={
@@ -1042,6 +1063,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         try:
             result = await st.tool_host.invoke(spec, body.arguments, namespace_id=ns_id)
+            await _record_audit(
+                st,
+                org_id=namespace.split("/", 1)[0],
+                action="mcp.call",
+                actor_id=_auth_principal(request, st),
+                resource_ref=str(tool_resource),
+                payload={"toolName": tool_name, "latencyMs": result.latency_ms},
+                ip=request.client.host if request.client else None,
+            )
             return {"result": result.output, "latencyMs": result.latency_ms}
         except (McpTransportError, SandboxViolation, ValueError) as e:
             raise HTTPException(400, detail=str(e)) from e
@@ -1050,7 +1080,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def execute_resource(
         namespace: str, body: dict, request: Request, environment: str | None = None
     ):
-        """Run a published agent or workflow once (Studio test runner / HITL seed)."""
+        """Run a published agent or workflow once (Studio test runner / HITL seed).
+
+        Set ``stream: true`` for SSE (``text/event-stream``) — multi-agent emits
+        ``turn`` events live, then a final ``done`` / ``error``.
+        """
+        import json as _json
+
+        from fastapi.responses import StreamingResponse
+
         from ai_platform.core.models import ExecutionRequest
         from ai_platform.orchestrator.engine import Orchestrator
         from ai_platform.telemetry.tracing import get_tracer
@@ -1062,13 +1100,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, detail="resource_ref is required")
         if body.get("input") is not None and not isinstance(body["input"], dict):
             raise HTTPException(400, detail="input must be an object")
+        want_stream = bool(body.get("stream"))
         execution = ExecutionRequest.model_validate(
             {
                 "resource_ref": body.get("resource_ref"),
                 "input": body.get("input") or {},
                 "session_id": body.get("session_id"),
                 "trace_id": body.get("trace_id"),
-                "stream": False,
+                "stream": want_stream,
             }
         )
         if not (
@@ -1088,6 +1127,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         bundle_key = f"{ns_id}:{env}"
         orchestrator.load_bundle(bundle_key, list(bundle.values()))
+        principal = _auth_principal(request, st)
+        org_id = namespace.split("/", 1)[0]
         tracer = get_tracer("ai-platform.api")
         with tracer.start_as_current_span("platform.execute") as span:
             span.set_attribute("resource.ref", execution.resource_ref)
@@ -1096,19 +1137,117 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             span.set_attribute(
                 "multi_agent", bool(body.get("multiAgent") or body.get("multi_agent"))
             )
+            span.set_attribute("stream", want_stream)
             result = await orchestrator.execute(
                 bundle_key,
                 execution,
-                principal=_auth_principal(request, st),
+                principal=principal,
                 environment=env,
-                org_id=namespace.split("/", 1)[0],
+                org_id=org_id,
                 namespace_id=ns_id,
                 multi_agent=bool(body.get("multiAgent") or body.get("multi_agent")),
                 collaboration=body.get("collaboration"),
             )
+
+        async def _audit_execute(final_payload: dict[str, Any] | None = None) -> None:
+            payload = {
+                "resourceRef": execution.resource_ref,
+                "multiAgent": bool(body.get("multiAgent") or body.get("multi_agent")),
+                "stream": want_stream,
+            }
+            if final_payload:
+                if final_payload.get("message") == "policy denied" or final_payload.get(
+                    "type"
+                ) == "error":
+                    payload["outcome"] = "denied_or_error"
+                    payload["reason"] = final_payload.get("reason") or final_payload.get(
+                        "message"
+                    )
+                    payload["matchedRule"] = final_payload.get("matchedRule")
+                else:
+                    payload["outcome"] = final_payload.get("status") or final_payload.get(
+                        "type"
+                    )
+            await _record_audit(
+                st,
+                org_id=org_id,
+                action="resource.execute",
+                actor_id=principal,
+                resource_ref=execution.resource_ref,
+                payload=payload,
+                ip=request.client.host if request.client else None,
+            )
+            if final_payload and (
+                final_payload.get("message") == "policy denied"
+                or (
+                    isinstance(final_payload.get("data"), dict)
+                    and final_payload["data"].get("message") == "policy denied"
+                )
+            ):
+                data = (
+                    final_payload["data"]
+                    if isinstance(final_payload.get("data"), dict)
+                    else final_payload
+                )
+                await _record_audit(
+                    st,
+                    org_id=org_id,
+                    action="policy.denied",
+                    actor_id=principal,
+                    resource_ref=execution.resource_ref,
+                    payload={
+                        "reason": data.get("reason"),
+                        "matchedRule": data.get("matchedRule"),
+                        "action": data.get("action"),
+                        "diagnosis": data.get("diagnosis"),
+                    },
+                    ip=request.client.host if request.client else None,
+                )
+
+        if want_stream:
+
+            async def event_gen():
+                final_data: dict[str, Any] | None = None
+                async for event in result:
+                    dumped = (
+                        event.model_dump(mode="json")
+                        if hasattr(event, "model_dump")
+                        else event
+                    )
+                    if isinstance(dumped, dict) and dumped.get("type") in {
+                        "done",
+                        "error",
+                    }:
+                        final_data = dumped.get("data") if isinstance(
+                            dumped.get("data"), dict
+                        ) else dumped
+                        if dumped.get("type") == "error" and isinstance(final_data, dict):
+                            final_data = {**final_data, "type": "error"}
+                    yield f"data: {_json.dumps(dumped)}\n\n"
+                await _audit_execute(final_data)
+                yield "data: {\"type\":\"stream_end\"}\n\n"
+
+            return StreamingResponse(
+                event_gen(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         if hasattr(result, "model_dump"):
-            return result.model_dump(mode="json")
-        return result
+            dumped = result.model_dump(mode="json")
+        else:
+            dumped = result
+        audit_payload = dumped.get("data") if isinstance(dumped, dict) else None
+        if isinstance(dumped, dict) and dumped.get("type") == "error":
+            audit_payload = {
+                **(audit_payload if isinstance(audit_payload, dict) else {}),
+                "type": "error",
+            }
+        await _audit_execute(audit_payload if isinstance(audit_payload, dict) else None)
+        return dumped
 
     @app.post("/v1/{namespace:path}/{kind}/{name}/unpublish")
     async def unpublish_resource(
@@ -1126,6 +1265,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await st.registry.unpublish(ns_id, ResourceKind(kind), name)
         except ValueError as e:
             raise HTTPException(404, detail=str(e)) from e
+        await _record_audit(
+            st,
+            org_id=namespace.split("/", 1)[0],
+            action="resource.unpublished",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"{kind}/{name}",
+            payload={"environment": env},
+            ip=request.client.host if request.client else None,
+        )
         return {"unpublished": True, "kind": kind, "name": name}
 
     # --- Dynamic Workflows ---
@@ -1196,7 +1344,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = 50,
         action: str | None = None,
     ):
-        """Org-scoped activity log (publish, login, secrets, promotions)."""
+        """Org-scoped activity log (publish, login, secrets, promotions, execute, …)."""
         st = state(request)
         _ = await st.registry.ensure_namespace(namespace, settings.default_env)
         org_id = namespace.split("/", 1)[0]
@@ -1207,6 +1355,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "orgId": org_id,
             "events": [e.model_dump(mode="json", by_alias=True) for e in events],
             "count": len(events),
+            "retentionDays": settings.audit_retention_days,
+        }
+
+    @app.post("/v1/{namespace:path}/audit/purge")
+    async def purge_audit_events(namespace: str, request: Request):
+        """Delete audit events older than PLATFORM_AUDIT_RETENTION_DAYS for this org."""
+        st = state(request)
+        _ = await st.registry.ensure_namespace(namespace, settings.default_env)
+        org_id = namespace.split("/", 1)[0]
+        deleted = await st.registry.purge_audit(
+            org_id, retain_days=settings.audit_retention_days
+        )
+        await _record_audit(
+            st,
+            org_id=org_id,
+            action="audit.purged",
+            actor_id=_auth_principal(request, st),
+            payload={
+                "deleted": deleted,
+                "retainDays": settings.audit_retention_days,
+            },
+            ip=request.client.host if request.client else None,
+        )
+        return {
+            "orgId": org_id,
+            "deleted": deleted,
+            "retainDays": settings.audit_retention_days,
         }
 
     @app.get("/v1/regions")
@@ -1221,6 +1396,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         region_id = await st.region_service.register_region(
             body.name, body.endpoint, body.data_residency, body.is_primary
         )
+        await _record_audit(
+            st,
+            org_id=settings.default_namespace.split("/", 1)[0],
+            action="region.registered",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"regions/{body.name}",
+            payload={"endpoint": body.endpoint, "isPrimary": body.is_primary},
+            ip=request.client.host if request.client else None,
+        )
         return {"regionId": region_id, "name": body.name}
 
     @app.post("/v1/regions/{name}/failover")
@@ -1229,6 +1413,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         new_primary = await st.region_service.failover(name)
         if not new_primary:
             raise HTTPException(503, detail="No failover region available")
+        await _record_audit(
+            st,
+            org_id=settings.default_namespace.split("/", 1)[0],
+            action="region.failover",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"regions/{name}",
+            payload={"newPrimary": new_primary.name},
+            ip=request.client.host if request.client else None,
+        )
         return {"failed": name, "newPrimary": new_primary.model_dump()}
 
     @app.post("/v1/regions/{name}/primary")
@@ -1239,6 +1432,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, detail="Region not found")
         await st.region_service.set_primary(name)
         primary = await st.region_service.get_primary()
+        await _record_audit(
+            st,
+            org_id=settings.default_namespace.split("/", 1)[0],
+            action="region.primary",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"regions/{name}",
+            ip=request.client.host if request.client else None,
+        )
         return {"primary": primary.model_dump() if primary else None}
 
     @app.post("/v1/edge/register")
@@ -1252,6 +1453,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body.bundle_cache_path,
             body.metadata,
         )
+        await _record_audit(
+            st,
+            org_id=body.namespace.split("/", 1)[0],
+            action="edge.registered",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"edge/{node_id}",
+            payload={"region": body.region, "namespaceId": ns_id},
+            ip=request.client.host if request.client else None,
+        )
         return {"nodeId": node_id, "namespaceId": ns_id, "mode": "edge"}
 
     @app.get("/v1/edge/nodes")
@@ -1260,11 +1470,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         nodes = await st.region_service.list_edge_nodes(limit=limit)
         return {"nodes": nodes, "count": len(nodes)}
 
+    @app.get("/v1/edge/telemetry")
+    async def list_edge_telemetry(
+        request: Request,
+        node_id: str | None = None,
+        limit: int = 100,
+        hours: int = 24,
+        summary: bool = True,
+    ):
+        st = state(request)
+        if summary:
+            return await st.region_service.telemetry_summary(hours=hours)
+        events = await st.region_service.list_edge_telemetry(
+            node_id=node_id, limit=limit
+        )
+        return {"events": events, "count": len(events)}
+
     @app.post("/v1/edge/{node_id}/telemetry")
     async def edge_telemetry(node_id: str, body: TelemetryBody, request: Request):
         st = state(request)
-        await st.region_service.record_edge_telemetry(node_id)
-        return {"received": len(body.events), "nodeId": node_id}
+        received = await st.region_service.record_edge_telemetry(node_id, body.events)
+        return {"received": received, "nodeId": node_id}
 
     @app.get("/v1/compliance/packs")
     async def list_compliance_packs(request: Request):

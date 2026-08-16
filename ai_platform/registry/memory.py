@@ -153,6 +153,18 @@ class InMemoryRegistryStore(RegistryStore):
         rows.sort(key=lambda e: e.created_at, reverse=True)
         return rows[:lim]
 
+    async def purge_audit(self, org_id: str, *, retain_days: int = 90) -> int:
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, retain_days))
+        before = len(self._audit)
+        self._audit = [
+            e
+            for e in self._audit
+            if not (e.org_id == org_id and e.created_at < cutoff)
+        ]
+        return before - len(self._audit)
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

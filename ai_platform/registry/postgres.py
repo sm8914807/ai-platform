@@ -310,6 +310,23 @@ class PostgresRegistryStore(RegistryStore):
             )
         return out
 
+    async def purge_audit(self, org_id: str, *, retain_days: int = 90) -> int:
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, retain_days))
+        result = await self.pool.execute(
+            "DELETE FROM audit_events WHERE org_id = $1 AND created_at < $2",
+            org_id,
+            cutoff,
+        )
+        # asyncpg returns status string like "DELETE 3"
+        if isinstance(result, str) and result.startswith("DELETE "):
+            try:
+                return int(result.split()[-1])
+            except ValueError:
+                return 0
+        return 0
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

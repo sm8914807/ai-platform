@@ -3,6 +3,8 @@ import {
   api,
   clearSession,
   DEFAULT_NS,
+  denialFromExecution,
+  formatError,
   getNamespace,
   getRecentNamespaces,
   getToken,
@@ -20,6 +22,7 @@ import {
   type MetricStats,
   type NamespaceInfo,
   type PlatformMessage,
+  type PolicyDenial,
   type RegionInfo,
   type Resource,
   type SecretMeta,
@@ -113,6 +116,40 @@ const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
 const COMMANDS: { id: View; label: string; hint: string }[] = NAV_GROUPS.flatMap((g) =>
   g.items.map((i) => ({ id: i.id, label: i.label, hint: g.label })),
 );
+
+function PolicyDenialCard({ denial }: { denial: PolicyDenial }) {
+  return (
+    <div className="panel policy-denial" style={{ marginBottom: "1rem", borderColor: "var(--danger, #b33)" }}>
+      <div className="form-section-title">Why this was denied</div>
+      <div className="diagnosis-card">
+        <div>
+          <span className="badge danger">policy denied</span>
+          {denial.action ? <span className="mono"> · {denial.action}</span> : null}
+          {denial.resource ? <span className="muted mono"> · {denial.resource}</span> : null}
+        </div>
+        {denial.reason ? (
+          <div>
+            <strong>Reason</strong> · <span className="mono">{denial.reason}</span>
+          </div>
+        ) : null}
+        {denial.matchedRule ? (
+          <div>
+            <strong>Matched rule</strong> · <span className="mono">{denial.matchedRule}</span>
+          </div>
+        ) : null}
+        {denial.gate ? (
+          <div>
+            <strong>Gate</strong> · <span className="mono">{denial.gate}</span>
+          </div>
+        ) : null}
+        {denial.diagnosis ? <p className="muted">{denial.diagnosis}</p> : null}
+        <p className="muted form-hint">
+          Publish a Policy that allows this principal/action, or remove the deny rule matching above.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [view, setView] = useState<View>("overview");
@@ -1385,8 +1422,11 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
   const [maxIterations, setMaxIterations] = useState(2);
   const [input, setInput] = useState('{"message":"Plan then answer a billing refund request"}');
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [liveSteps, setLiveSteps] = useState<Array<Record<string, unknown>>>([]);
+  const [policyDenial, setPolicyDenial] = useState<PolicyDenial | null>(null);
   const [busy, setBusy] = useState(false);
   const [saveBusy, setSaveBusy] = useState(false);
+  const [streaming, setStreaming] = useState(true);
 
   const load = useCallback(() => {
     api
@@ -1436,17 +1476,21 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
   }, [agentRef, selected?.name]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const roles = collaborationRoles(pattern);
-  const steps = Array.isArray(result?.steps)
-    ? (result?.steps as Array<Record<string, unknown>>)
-    : [];
+  const steps = (
+    Array.isArray(result?.steps)
+      ? (result?.steps as Array<Record<string, unknown>>)
+      : liveSteps
+  );
   const errors = Array.isArray(result?.errors)
     ? (result?.errors as Array<Record<string, unknown>>)
     : [];
-  const status = String(result?.status ?? "");
+  const status = String(result?.status ?? (busy ? "running" : ""));
 
   async function run() {
     setBusy(true);
     setResult(null);
+    setLiveSteps([]);
+    setPolicyDenial(null);
     try {
       const payload = JSON.parse(input) as Record<string, unknown>;
       const collaboration = {
@@ -1455,10 +1499,44 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
         sharedContext: true,
         agents: wiring,
       };
-      const r = await api.runResource(ns, agentRef, payload, true, collaboration);
-      setResult((r.data ?? r) as unknown as Record<string, unknown>);
+      if (streaming) {
+        let finalData: Record<string, unknown> | null = null;
+        const collected: Array<Record<string, unknown>> = [];
+        for await (const event of api.runResourceStream(
+          ns,
+          agentRef,
+          payload,
+          true,
+          collaboration,
+        )) {
+          if (event.type === "turn" && event.data?.step) {
+            const step = event.data.step as Record<string, unknown>;
+            collected.push(step);
+            setLiveSteps([...collected]);
+          } else if (event.type === "done" || event.type === "error") {
+            finalData = (event.data ?? event) as Record<string, unknown>;
+            setResult(finalData);
+            const denial = denialFromExecution(finalData);
+            if (denial) setPolicyDenial(denial);
+          }
+        }
+        if (!finalData) {
+          setResult({ status: "completed", steps: collected });
+        }
+      } else {
+        const r = await api.runResource(ns, agentRef, payload, true, collaboration);
+        const data = (r.data ?? r) as unknown as Record<string, unknown>;
+        setResult(data);
+        const denial = denialFromExecution(data);
+        if (denial) setPolicyDenial(denial);
+      }
     } catch (e) {
-      onError(String((e as Error).message ?? e));
+      const denial =
+        e && typeof e === "object" && "denial" in e
+          ? ((e as { denial: PolicyDenial | null }).denial ?? null)
+          : null;
+      if (denial) setPolicyDenial(denial);
+      onError(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -1498,11 +1576,19 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
           </p>
         </div>
         <div className="form-row">
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={streaming}
+              onChange={(e) => setStreaming(e.target.checked)}
+            />
+            Live stream turns
+          </label>
           <button className="ghost" disabled={saveBusy || !selected} onClick={() => void saveWiring()}>
             {saveBusy ? "Saving…" : "Save wiring"}
           </button>
           <button className="primary" disabled={busy || agents.length === 0} onClick={() => void run()}>
-            {busy ? "Running…" : "Run collaboration"}
+            {busy ? (streaming ? "Streaming…" : "Running…") : "Run collaboration"}
           </button>
         </div>
       </header>
@@ -1587,6 +1673,8 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
         </div>
       </div>
 
+      {policyDenial && <PolicyDenialCard denial={policyDenial} />}
+
       {errors.length > 0 && (
         <div className="panel" style={{ marginBottom: "1rem", borderColor: "var(--danger, #b33)" }}>
           <div className="form-section-title">Failure diagnosis</div>
@@ -1609,9 +1697,15 @@ function CollaborationView({ ns, onError }: { ns: string; onError: (e: string) =
       )}
 
       <div className="panel">
-        <div className="form-section-title">Turn timeline</div>
+        <div className="form-section-title">
+          Turn timeline {busy && streaming ? <span className="badge warn">live</span> : null}
+        </div>
         {steps.length === 0 ? (
-          <p className="muted">Run a collaboration to see planner/executor/reviewer turns.</p>
+          <p className="muted">
+            {busy
+              ? "Waiting for first turn…"
+              : "Run a collaboration to see planner/executor/reviewer turns."}
+          </p>
         ) : (
           <ol className="turn-timeline">
             {steps.map((step, i) => {
@@ -3163,15 +3257,31 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
   const [isPrimary, setIsPrimary] = useState(false);
   const [edgeRegion, setEdgeRegion] = useState("");
   const [cachePath, setCachePath] = useState(".platform/bundle.cache.json");
+  const [telemetry, setTelemetry] = useState<{
+    eventCount?: number;
+    onlineCount?: number;
+    nodeCount?: number;
+    series?: Array<{
+      index: number;
+      count: number;
+      successRate: number | null;
+      avgLatencyMs: number | null;
+    }>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [r, e] = await Promise.all([api.listRegions(), api.listEdgeNodes()]);
+      const [r, e, t] = await Promise.all([
+        api.listRegions(),
+        api.listEdgeNodes(),
+        api.listEdgeTelemetry({ hours: 24, summary: true }),
+      ]);
       setRegions(r.regions);
       setNodes(e.nodes);
+      setTelemetry(t);
       setEdgeRegion((prev) => prev || r.regions[0]?.name || "");
     } catch (err) {
-      onError(String((err as Error).message ?? err));
+      onError(formatError(err));
     }
   }, [onError]);
 
@@ -3193,7 +3303,7 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
       setName("");
       await load();
     } catch (e) {
-      onError(String((e as Error).message ?? e));
+      onError(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -3211,7 +3321,31 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
       setResult(JSON.stringify(r, null, 2));
       await load();
     } catch (e) {
-      onError(String((e as Error).message ?? e));
+      onError(formatError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pingTelemetry(nodeId: string) {
+    setBusy(true);
+    try {
+      const r = await api.postEdgeTelemetry(nodeId, [
+        {
+          type: "heartbeat",
+          latencyMs: 20 + Math.round(Math.random() * 80),
+          success: true,
+        },
+        {
+          type: "sync",
+          latencyMs: 40 + Math.round(Math.random() * 120),
+          success: true,
+        },
+      ]);
+      setResult(JSON.stringify(r, null, 2));
+      await load();
+    } catch (e) {
+      onError(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -3219,6 +3353,12 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
 
   const primary = regions.find((r) => r.is_primary);
   const online = nodes.filter((n) => n.status === "online").length;
+  const series = telemetry?.series ?? [];
+  const maxLatency = Math.max(
+    1,
+    ...series.map((s) => Number(s.avgLatencyMs ?? 0)),
+  );
+  const maxCount = Math.max(1, ...series.map((s) => s.count));
 
   return (
     <section>
@@ -3226,7 +3366,7 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
         <div>
           <h1>Regions & edge</h1>
           <p className="muted">
-            Multi-region control-plane endpoints, failover, and edge runtime registrations.
+            Multi-region control-plane endpoints, failover, and edge runtime telemetry.
           </p>
         </div>
         <button onClick={() => void load()}>Refresh</button>
@@ -3243,6 +3383,70 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
           <div className="metric-value">{nodes.length}</div>
           <div className="muted mono">{online} online</div>
         </div>
+        <div className="metric-card">
+          <div className="metric-label">Telemetry (24h)</div>
+          <div className="metric-value">{telemetry?.eventCount ?? 0}</div>
+          <div className="muted mono">
+            {telemetry?.onlineCount ?? online}/{telemetry?.nodeCount ?? nodes.length} online
+          </div>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: "1.25rem" }}>
+        <div className="form-section-title">Edge telemetry charts</div>
+        {series.every((s) => s.count === 0) ? (
+          <p className="muted">
+            No telemetry yet. Register an edge node and click <em>Ping telemetry</em>.
+          </p>
+        ) : (
+          <div className="split">
+            <div>
+              <div className="muted form-hint">Avg latency (ms)</div>
+              {series.map((s) => (
+                <div key={`lat-${s.index}`} className="metric-bar-row">
+                  <div className="metric-bar-meta">
+                    <span className="mono">t{s.index + 1}</span>
+                    <span className="muted mono">
+                      {s.avgLatencyMs != null ? `${s.avgLatencyMs} ms` : "—"}
+                    </span>
+                  </div>
+                  <div className="metric-bar-track">
+                    <div
+                      className="metric-bar-fill"
+                      style={{
+                        width: `${Math.round(((s.avgLatencyMs ?? 0) / maxLatency) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div>
+              <div className="muted form-hint">Event volume / success</div>
+              {series.map((s) => (
+                <div key={`vol-${s.index}`} className="metric-bar-row">
+                  <div className="metric-bar-meta">
+                    <span className="mono">n={s.count}</span>
+                    <span className="muted mono">
+                      {s.successRate != null
+                        ? `${Math.round(s.successRate * 100)}% ok`
+                        : "—"}
+                    </span>
+                  </div>
+                  <div className="metric-bar-track">
+                    <div
+                      className="metric-bar-fill"
+                      style={{
+                        width: `${Math.round((s.count / maxCount) * 100)}%`,
+                        opacity: s.successRate != null ? 0.45 + s.successRate * 0.55 : 0.6,
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="split" style={{ marginTop: "1.25rem" }}>
@@ -3376,9 +3580,18 @@ function RegionsView({ ns, onError }: { ns: string; onError: (e: string) => void
                       sync {n.lastSyncAt ?? "—"} · telemetry {n.lastTelemetryAt ?? "—"}
                     </div>
                   </div>
-                  <span className={n.status === "online" ? "badge ok" : "badge warn"}>
-                    {n.status}
-                  </span>
+                  <div className="form-row">
+                    <button
+                      className="ghost"
+                      disabled={busy}
+                      onClick={() => void pingTelemetry(n.id)}
+                    >
+                      Ping telemetry
+                    </button>
+                    <span className={n.status === "online" ? "badge ok" : "badge warn"}>
+                      {n.status}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
@@ -3582,18 +3795,22 @@ function ActivityView({ ns, onError }: { ns: string; onError: (e: string) => voi
   const [orgId, setOrgId] = useState("");
   const [selected, setSelected] = useState<AuditEvent | null>(null);
   const [filter, setFilter] = useState("");
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [resultNotice, setResultNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
       const r = await api.listAudit(ns, 80, filter || undefined);
       setEvents(r.events);
       setOrgId(r.orgId);
+      if (r.retentionDays != null) setRetentionDays(r.retentionDays);
       setSelected((prev) => {
         if (!prev) return null;
         return r.events.find((e) => e.id === prev.id) ?? null;
       });
     } catch (e) {
-      onError(String((e as Error).message ?? e));
+      onError(formatError(e));
     }
   }, [ns, onError, filter]);
 
@@ -3601,27 +3818,57 @@ function ActivityView({ ns, onError }: { ns: string; onError: (e: string) => voi
     void load();
   }, [load]);
 
+  async function purge() {
+    setBusy(true);
+    try {
+      const r = await api.purgeAudit(ns);
+      setResultNotice(`Purged ${r.deleted} events older than ${r.retainDays}d`);
+      await load();
+    } catch (e) {
+      onError(formatError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section>
       <header className="page-header row">
         <div>
           <h1>Activity</h1>
           <p className="muted">
-            Org audit trail — publishes, logins, secret writes, and promotions for{" "}
-            <span className="mono">{orgId || ns.split("/")[0]}</span>.
+            Org audit trail for <span className="mono">{orgId || ns.split("/")[0]}</span>
+            {retentionDays != null ? ` · retention ${retentionDays}d` : ""}.
           </p>
         </div>
         <div className="form-row">
           <select value={filter} onChange={(e) => setFilter(e.target.value)}>
             <option value="">All actions</option>
             <option value="resource.published">resource.published</option>
+            <option value="resource.unpublished">resource.unpublished</option>
+            <option value="resource.execute">resource.execute</option>
+            <option value="policy.denied">policy.denied</option>
+            <option value="mcp.call">mcp.call</option>
             <option value="auth.login">auth.login</option>
             <option value="secret.put">secret.put</option>
             <option value="environment.promoted">environment.promoted</option>
+            <option value="region.registered">region.registered</option>
+            <option value="region.failover">region.failover</option>
+            <option value="edge.registered">edge.registered</option>
+            <option value="audit.purged">audit.purged</option>
           </select>
           <button onClick={() => void load()}>Refresh</button>
+          <button className="ghost" disabled={busy} onClick={() => void purge()}>
+            {busy ? "Purging…" : "Purge old"}
+          </button>
         </div>
       </header>
+
+      {resultNotice && (
+        <div className="banner" onClick={() => setResultNotice(null)}>
+          {resultNotice}
+        </div>
+      )}
 
       <div className="metric-grid" style={{ marginBottom: "1rem" }}>
         <div className="metric-card">

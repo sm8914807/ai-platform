@@ -75,7 +75,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || res.statusText);
+    let parsed: unknown = text;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+    const denial = parsePolicyDenial(parsed, res.status);
+    const message =
+      denial != null
+        ? formatError(new ApiError(text || res.statusText, res.status, parsed, denial))
+        : text || res.statusText;
+    throw new ApiError(message, res.status, parsed, denial);
   }
   return res.json() as Promise<T>;
 }
@@ -106,10 +117,100 @@ export type DiscoveredAgent = {
 };
 
 export type ExecutionEvent = {
-  type: "token" | "tool_call" | "tool_result" | "approval_required" | "done" | "error";
+  type: "token" | "tool_call" | "tool_result" | "turn" | "approval_required" | "done" | "error" | "stream_end";
   data: Record<string, unknown>;
   execution_id?: string | null;
 };
+
+/** Structured API / policy denial extracted from HTTP error bodies. */
+export type PolicyDenial = {
+  message: string;
+  reason?: string;
+  matchedRule?: string;
+  action?: string;
+  resource?: string;
+  diagnosis?: string;
+  gate?: string;
+  status?: number;
+};
+
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  denial: PolicyDenial | null;
+
+  constructor(message: string, status: number, detail: unknown, denial: PolicyDenial | null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.denial = denial;
+  }
+}
+
+export function parsePolicyDenial(raw: unknown, status = 0): PolicyDenial | null {
+  let detail: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      detail = JSON.parse(raw);
+    } catch {
+      if (/policy denied/i.test(raw)) {
+        return { message: "policy denied", diagnosis: raw, status };
+      }
+      return null;
+    }
+  }
+  if (!detail || typeof detail !== "object") return null;
+  const obj = detail as Record<string, unknown>;
+  const inner =
+    obj.detail && typeof obj.detail === "object"
+      ? (obj.detail as Record<string, unknown>)
+      : obj.data && typeof obj.data === "object"
+        ? (obj.data as Record<string, unknown>)
+        : obj;
+  const message = String(inner.message ?? inner.gate ?? "");
+  if (!/policy denied|policy_denied/i.test(message) && !inner.matchedRule && !inner.reason) {
+    return null;
+  }
+  return {
+    message: message || "policy denied",
+    reason: inner.reason != null ? String(inner.reason) : undefined,
+    matchedRule: inner.matchedRule != null ? String(inner.matchedRule) : undefined,
+    action: inner.action != null ? String(inner.action) : undefined,
+    resource: inner.resource != null ? String(inner.resource) : undefined,
+    diagnosis: inner.diagnosis != null ? String(inner.diagnosis) : undefined,
+    gate: inner.gate != null ? String(inner.gate) : undefined,
+    status,
+  };
+}
+
+export function formatError(err: unknown): string {
+  if (err instanceof ApiError && err.denial) {
+    const d = err.denial;
+    const parts = [d.message];
+    if (d.reason) parts.push(`reason: ${d.reason}`);
+    if (d.matchedRule) parts.push(`rule: ${d.matchedRule}`);
+    if (d.action) parts.push(`action: ${d.action}`);
+    if (d.diagnosis) parts.push(d.diagnosis);
+    return parts.join(" · ");
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+export function denialFromExecution(data: Record<string, unknown> | null | undefined): PolicyDenial | null {
+  if (!data) return null;
+  if (String(data.message ?? "") === "policy denied" || data.matchedRule || data.reason) {
+    return {
+      message: String(data.message ?? "policy denied"),
+      reason: data.reason != null ? String(data.reason) : undefined,
+      matchedRule: data.matchedRule != null ? String(data.matchedRule) : undefined,
+      action: data.action != null ? String(data.action) : undefined,
+      diagnosis: data.diagnosis != null ? String(data.diagnosis) : undefined,
+    };
+  }
+  return null;
+}
 
 export type CompliancePack = {
   id: string;
@@ -390,6 +491,76 @@ export const api = {
         ...(collaboration ? { collaboration } : {}),
       }),
     }),
+  /**
+   * SSE execute — yields turn/done/error events. Used by Multi-agent Studio.
+   */
+  runResourceStream: async function* (
+    ns: string,
+    resourceRef: string,
+    input: Record<string, unknown>,
+    multiAgent = false,
+    collaboration?: Record<string, unknown>,
+  ): AsyncGenerator<ExecutionEvent> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/v1/${ns}/execute`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        resource_ref: resourceRef,
+        input,
+        multiAgent,
+        stream: true,
+        ...(collaboration ? { collaboration } : {}),
+      }),
+    });
+    if (res.status === 401) {
+      clearSession();
+      throw new Error("Session expired — sign in again");
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      let parsed: unknown = text;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = text;
+      }
+      const denial = parsePolicyDenial(parsed, res.status);
+      throw new ApiError(text || res.statusText, res.status, parsed, denial);
+    }
+    if (!res.body) {
+      throw new Error("No response body for stream");
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part
+          .split("\n")
+          .map((l) => l.trim())
+          .find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const raw = line.slice(5).trim();
+        if (!raw) continue;
+        let event: ExecutionEvent;
+        try {
+          event = JSON.parse(raw) as ExecutionEvent;
+        } catch {
+          continue;
+        }
+        if (event.type === "stream_end") return;
+        yield event;
+      }
+    }
+  },
   listNamespaces: () =>
     request<{ namespaces: NamespaceInfo[]; default: string; environment: string }>(
       "/v1/namespaces",
@@ -495,6 +666,33 @@ export const api = {
     ),
   listEdgeNodes: (limit = 100) =>
     request<{ nodes: EdgeNode[]; count: number }>(`/v1/edge/nodes?limit=${limit}`),
+  listEdgeTelemetry: (opts?: { hours?: number; nodeId?: string; summary?: boolean }) => {
+    const q = new URLSearchParams();
+    if (opts?.hours != null) q.set("hours", String(opts.hours));
+    if (opts?.nodeId) q.set("node_id", opts.nodeId);
+    if (opts?.summary === false) q.set("summary", "false");
+    const qs = q.toString();
+    return request<{
+      hours?: number;
+      eventCount?: number;
+      nodeCount?: number;
+      onlineCount?: number;
+      series?: Array<{
+        index: number;
+        count: number;
+        successRate: number | null;
+        avgLatencyMs: number | null;
+      }>;
+      recent?: Array<Record<string, unknown>>;
+      events?: Array<Record<string, unknown>>;
+      count?: number;
+    }>(`/v1/edge/telemetry${qs ? `?${qs}` : ""}`);
+  },
+  postEdgeTelemetry: (nodeId: string, events: Array<Record<string, unknown>>) =>
+    request<{ received: number; nodeId: string }>(
+      `/v1/edge/${encodeURIComponent(nodeId)}/telemetry`,
+      { method: "POST", body: JSON.stringify({ events }) },
+    ),
   registerEdgeNode: (body: {
     namespace: string;
     environment?: string;
@@ -515,10 +713,18 @@ export const api = {
   listAudit: (ns = DEFAULT_NS, limit = 50, action?: string) => {
     const q = new URLSearchParams({ limit: String(limit) });
     if (action) q.set("action", action);
-    return request<{ orgId: string; events: AuditEvent[]; count: number }>(
-      `/v1/${ns}/audit?${q.toString()}`,
-    );
+    return request<{
+      orgId: string;
+      events: AuditEvent[];
+      count: number;
+      retentionDays?: number;
+    }>(`/v1/${ns}/audit?${q.toString()}`);
   },
+  purgeAudit: (ns = DEFAULT_NS) =>
+    request<{ orgId: string; deleted: number; retainDays: number }>(
+      `/v1/${ns}/audit/purge`,
+      { method: "POST" },
+    ),
   scimListUsers: (orgId = "default-org") =>
     request<{
       schemas: string[];

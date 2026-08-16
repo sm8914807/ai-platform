@@ -339,6 +339,20 @@ class SqliteRegistryStore(RegistryStore):
             )
         return out
 
+    async def purge_audit(self, org_id: str, *, retain_days: int = 90) -> int:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retain_days))).isoformat()
+        conn = await self._connect()
+        cur = await conn.execute(
+            "DELETE FROM audit_events WHERE org_id = ? AND created_at < ?",
+            (org_id, cutoff),
+        )
+        deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        await conn.commit()
+        await conn.close()
+        return int(deleted)
+
     async def register_runtime_node(
         self, namespace_id: str, node_type: str = "sdk", metadata: dict[str, Any] | None = None
     ) -> str:

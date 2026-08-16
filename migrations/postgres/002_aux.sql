@@ -313,3 +313,17 @@ CREATE INDEX IF NOT EXISTS idx_traces_ns ON decision_traces(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_caps_ns ON agent_capabilities(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_route_metrics_route ON model_route_metrics(route_name, namespace_id);
 CREATE INDEX IF NOT EXISTS idx_amtp_status_msg ON amtp_delivery_status(message_id);
+
+CREATE TABLE IF NOT EXISTS edge_telemetry_events (
+  id TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL,
+  event_type TEXT NOT NULL DEFAULT 'heartbeat',
+  latency_ms DOUBLE PRECISION,
+  success BOOLEAN,
+  payload_json JSONB NOT NULL DEFAULT '{}',
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_edge_telemetry_node
+  ON edge_telemetry_events(node_id, recorded_at);
+

@@ -112,6 +112,86 @@ class Orchestrator:
                             if isinstance(collaboration, CollaborationSpec)
                             else CollaborationSpec.model_validate(collaboration)
                         )
+
+                    def _multi_event(result: Any) -> ExecutionEvent:
+                        return ExecutionEvent(
+                            type="done" if result.status != "failed" else "error",
+                            data={
+                                "pattern": result.pattern,
+                                "iterations": result.iterations,
+                                "steps": result.steps,
+                                "status": result.status,
+                                "errors": result.errors,
+                                "wiring": result.wiring,
+                                "content": result.final_output.get("content", result.final_output),
+                                "finalOutput": result.final_output,
+                                "message": (
+                                    result.errors[0].get("message")
+                                    if result.status == "failed" and result.errors
+                                    else None
+                                ),
+                                "diagnosis": (
+                                    result.errors[0].get("diagnosis")
+                                    if result.status == "failed" and result.errors
+                                    else None
+                                ),
+                            },
+                            execution_id=trace_id,
+                        )
+
+                    if request.stream:
+                        import asyncio
+
+                        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+                        async def on_turn(step: dict[str, Any]) -> None:
+                            await queue.put(("turn", step))
+
+                        async def runner() -> None:
+                            try:
+                                result = await self.multi_agent_engine.run(
+                                    bundle,
+                                    request.resource_ref,
+                                    request.input,
+                                    collaboration=override,
+                                    session_id=request.session_id,
+                                    org_id=org_id,
+                                    namespace_id=namespace_id,
+                                    principal=principal,
+                                    environment=environment,
+                                    policy_engine=self.policy_engine,
+                                    on_turn=on_turn,
+                                )
+                                await queue.put(("done", result))
+                            except Exception as exc:  # noqa: BLE001
+                                await queue.put(("error", exc))
+
+                        async def _multi_stream() -> AsyncIterator[ExecutionEvent]:
+                            task = asyncio.create_task(runner())
+                            try:
+                                while True:
+                                    kind, payload = await queue.get()
+                                    if kind == "turn":
+                                        yield ExecutionEvent(
+                                            type="turn",
+                                            data={"step": payload, "kind": "multi_agent_turn"},
+                                            execution_id=trace_id,
+                                        )
+                                    elif kind == "error":
+                                        yield ExecutionEvent(
+                                            type="error",
+                                            data={"message": str(payload)},
+                                            execution_id=trace_id,
+                                        )
+                                        break
+                                    else:
+                                        yield _multi_event(payload)
+                                        break
+                            finally:
+                                await task
+
+                        return _multi_stream()
+
                     result = await self.multi_agent_engine.run(
                         bundle,
                         request.resource_ref,
@@ -124,35 +204,7 @@ class Orchestrator:
                         environment=environment,
                         policy_engine=self.policy_engine,
                     )
-                    event = ExecutionEvent(
-                        type="done" if result.status != "failed" else "error",
-                        data={
-                            "pattern": result.pattern,
-                            "iterations": result.iterations,
-                            "steps": result.steps,
-                            "status": result.status,
-                            "errors": result.errors,
-                            "wiring": result.wiring,
-                            "content": result.final_output.get("content", result.final_output),
-                            "finalOutput": result.final_output,
-                            "message": (
-                                result.errors[0].get("message")
-                                if result.status == "failed" and result.errors
-                                else None
-                            ),
-                            "diagnosis": (
-                                result.errors[0].get("diagnosis")
-                                if result.status == "failed" and result.errors
-                                else None
-                            ),
-                        },
-                        execution_id=trace_id,
-                    )
-                    if request.stream:
-                        async def _multi():
-                            yield event
-                        return _multi()
-                    return event
+                    return _multi_event(result)
 
                 result = await self.agent_engine.execute(
                     bundle,

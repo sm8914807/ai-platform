@@ -158,6 +158,7 @@ SQLITE_MIGRATIONS = [
     ROOT / "migrations" / "004_phase4.sql",
     ROOT / "migrations" / "005_differentiators.sql",
     ROOT / "migrations" / "006_messaging.sql",
+    ROOT / "migrations" / "007_edge_telemetry.sql",
 ]
 
 SECRETS_DDL = """

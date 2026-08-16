@@ -48,3 +48,5 @@ class Settings(BaseSettings):
     otlp_console: bool = False
     # Keep finished spans in-memory (tests / local debugging).
     otlp_memory: bool = False
+    # Audit log retention (days). Events older than this are purged on boot / via API.
+    audit_retention_days: int = 90

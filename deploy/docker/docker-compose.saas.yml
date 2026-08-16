@@ -1,0 +1,37 @@
+# SaaS overlay: Postgres-backed API + Redis governor + static Studio (:8088).
+# Prefer: ./scripts/saas-up.sh
+# Or: docker compose -f deploy/docker/docker-compose.yml \
+#        -f deploy/docker/docker-compose.saas.yml --profile saas up -d --build
+
+services:
+  api:
+    environment:
+      PLATFORM_ENV: ${PLATFORM_ENV:-development}
+      PLATFORM_DATABASE_URL: ${PLATFORM_DATABASE_URL:-postgresql://platform:platform@postgres:5432/ai_platform}
+      PLATFORM_DB_PATH: /data/aux.db
+      PLATFORM_REDIS_URL: ${PLATFORM_REDIS_URL:-redis://redis:6379/0}
+      PLATFORM_GOVERNOR_BACKEND: ${PLATFORM_GOVERNOR_BACKEND:-redis}
+      PLATFORM_AUTH_REQUIRED: ${PLATFORM_AUTH_REQUIRED:-true}
+      PLATFORM_ALLOW_DEV_LOGIN: ${PLATFORM_ALLOW_DEV_LOGIN:-true}
+      PLATFORM_SECRETS_KEY: ${PLATFORM_SECRETS_KEY:-}
+      PLATFORM_AUTH_SECRET: ${PLATFORM_AUTH_SECRET:-}
+      PLATFORM_AUDIT_RETENTION_DAYS: ${PLATFORM_AUDIT_RETENTION_DAYS:-90}
+      PLATFORM_CORS_ORIGINS: ${PLATFORM_CORS_ORIGINS:-http://localhost:8088,http://127.0.0.1:8088,http://localhost:5173}
+      PLATFORM_OIDC_ISSUER: ${PLATFORM_OIDC_ISSUER:-}
+      PLATFORM_OIDC_CLIENT_ID: ${PLATFORM_OIDC_CLIENT_ID:-}
+      PLATFORM_OIDC_CLIENT_SECRET: ${PLATFORM_OIDC_CLIENT_SECRET:-}
+      PLATFORM_OIDC_REDIRECT_URI: ${PLATFORM_OIDC_REDIRECT_URI:-http://localhost:8088/}
+      PLATFORM_FEDERATION_DOMAIN: ${PLATFORM_FEDERATION_DOMAIN:-saas.ai-platform}
+
+  console-saas:
+    profiles: ["saas"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.console
+      args:
+        VITE_API_BASE: ""
+    ports:
+      - "8088:80"
+    depends_on:
+      api:
+        condition: service_healthy

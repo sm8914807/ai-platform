@@ -169,7 +169,15 @@ class ExecutionRequest(BaseModel):
 
 
 class ExecutionEvent(BaseModel):
-    type: Literal["token", "tool_call", "tool_result", "approval_required", "done", "error"]
+    type: Literal[
+        "token",
+        "tool_call",
+        "tool_result",
+        "turn",
+        "approval_required",
+        "done",
+        "error",
+    ]
     data: dict[str, Any] = Field(default_factory=dict)
     execution_id: str | None = None
 
