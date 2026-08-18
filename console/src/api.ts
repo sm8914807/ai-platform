@@ -339,6 +339,50 @@ export type MetricStats = {
   totalCostUnits: number;
 };
 
+export type ReadinessCheck = {
+  id: string;
+  dimension: string;
+  status: "pass" | "warn" | "fail";
+  score: number;
+  title: string;
+  detail: string;
+  blocking: boolean;
+  evidence: Record<string, unknown>;
+};
+
+export type ReadinessDimension = {
+  name: string;
+  score: number;
+  status: "pass" | "warn" | "fail";
+  checks: ReadinessCheck[];
+};
+
+export type ReadinessReport = {
+  agentRef: string;
+  version?: string | null;
+  overall: number;
+  decision: "safe_to_deploy" | "watch" | "not_ready";
+  decisionLabel: string;
+  dimensions: ReadinessDimension[];
+  blockers: string[];
+  warnings: string[];
+  recommendations: string[];
+  previousOverall?: number | null;
+  drift?: {
+    previousOverall?: number;
+    delta?: number;
+    degraded?: boolean;
+    dimensions?: Record<string, { from: number; to: number; delta: number }>;
+  } | null;
+};
+
+export type ReadinessInventory = {
+  namespace: string;
+  count: number;
+  notReady: number;
+  agents: ReadinessReport[];
+};
+
 export const api = {
   health: () => request<Health>("/health"),
   authConfig: () =>
@@ -443,6 +487,12 @@ export const api = {
     }),
   recentEvaluations: (ns = DEFAULT_NS) =>
     request<{ runs: Record<string, unknown>[] }>(`/v1/${ns}/evaluations/recent`),
+  listReadiness: (ns = DEFAULT_NS) =>
+    request<ReadinessInventory>(`/v1/${ns}/readiness`),
+  getReadiness: (ns: string, name: string) =>
+    request<ReadinessReport>(`/v1/${ns}/readiness/${name}`),
+  checkReadiness: (ns: string, name: string) =>
+    request<ReadinessReport>(`/v1/${ns}/readiness/${name}/check`, { method: "POST" }),
   listTraces: (ns = DEFAULT_NS) =>
     request<{ traces: Trace[] }>(`/v1/${ns}/traces`),
   createTrace: (ns: string, body: unknown) =>

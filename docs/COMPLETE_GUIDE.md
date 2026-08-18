@@ -29,16 +29,20 @@
 
 ## 1. Product: what this platform is
 
-This is an **enterprise control plane for AI agents**.
+This is the **production control plane for AI agents**.
 
-The core idea (same as Kubernetes for containers, but for agents):
+The promise: **test, secure, deploy, and continuously validate every AI agent before and after it reaches production**. The question it answers is not “what feature should I add?” — it is:
+
+> Why would an engineering team install this instead of AgentCore / Foundry / LangSmith?
+
+Those products already own runtime, eval dashboards, and generic agent editors. This platform sits **above** them as a decision layer: *can this agent version replace production, and is it still safe tomorrow?*
 
 | Traditional app | This platform |
 |-----------------|---------------|
 | Prompts buried in Python/TS | Versioned **Prompt** CRDs |
 | Hardcoded OpenAI client | **ModelRoute** with fallbacks |
 | Ad-hoc HTTP tool calls | **Tool** + **Toolbox** + sandbox |
-| “Hope the agent is safe” | **Policy** + **Guardrail** + publish gates |
+| “Hope the agent is safe” | **Production Readiness** score + blockers (policy, guardrails, evals, metrics) |
 | No audit of decisions | **Context graph** traces + precedents |
 | One agent script | **Workflow** + multi-agent patterns + discovery |
 
@@ -52,6 +56,8 @@ The core idea (same as Kubernetes for containers, but for agents):
 | CLI | `ai_platform/cli.py` (`platform`, `platform-api`) | DevOps / local runs |
 | Schemas | `schemas/v1/*.json` | Validation contract |
 | Examples | `examples/resources/*.yaml` | Seed / learning catalog |
+
+**What we will not compete on:** another model provider, another CRD for its own sake, basic RAG/memory/chat playground, or a generic observability dashboard. AWS / LangSmith / Microsoft already have momentum there. See §13.
 
 **What it is *not* (yet):** a fully authenticated multi-tenant SaaS with every enterprise IdP wired — but JWT auth, durable stores, and production MCP are in place. See §12.
 
@@ -147,6 +153,7 @@ ai-platform/
 | `secrets/` | Fernet encrypt + leases | `manager.py` |
 | `auth/` | Identity store, SCIM, SSO JWT | `identity.py`, `sso.py` |
 | `evaluation/` | Eval suites for publish gates | `runner.py` |
+| `readiness/` | Production readiness score + deploy decision | `engine.py` |
 | `compliance/` | HIPAA/PCI/GDPR/SOC2 packs | `packs.py` |
 | `marketplace/` | Plugin catalog + install | `service.py` |
 | `git_sync/` | Apply/export CRDs from git | `service.py` |
@@ -593,6 +600,26 @@ Used on: publish, agent run (orchestrator).
 
 **Use case:** Ops sees p95 latency spike on `models/gpt-4o-routed`, drills into candidates, runs auto-tune to reweight; traces land in Jaeger/Grafana Tempo via OTLP.
 
+### 7.21 Production readiness (decision layer)
+
+`readiness/engine.py` inspects the published bundle plus eval history and route metrics. It does **not** run the agent. Missing evidence **lowers** the score.
+
+Dimensions (weighted): security, quality, reliability, governance, deployment, performance, cost.
+
+Decisions:
+
+| Score / blockers | Decision |
+|------------------|----------|
+| Any blocking check, or overall &lt; 70 | `not_ready` |
+| 70–79, or score dropped ≥ 8 vs last check | `watch` |
+| ≥ 80 and no blockers | `safe_to_deploy` |
+
+**APIs:** `GET /v1/{ns}/readiness` (inventory), `GET /v1/{ns}/readiness/{name}`, `POST .../check` (records `readiness.checked` audit).
+
+**Studio:** Ops → **Readiness**. Overview → **Production Check**.
+
+**Use case:** Refund agent v23 scores 84/100. Blockers: no timeout on refund API, three tools without least privilege, eval coverage 42%. Decision: **NOT READY FOR PRODUCTION** — not a trace dump.
+
 ---
 
 ## 8. Platform Studio (console) map
@@ -617,6 +644,7 @@ Used on: publish, agent run (orchestrator).
 | `compliance` | Compliance | List + install packs | compliance/* |
 | `metrics` | Metrics | Route latency / cost / tune | metrics/* |
 | `evaluations` | Evaluations | Suites + publish gates | evaluation/* |
+| `readiness` | Readiness | Production score, blockers, deploy decision | `/v1/{ns}/readiness*` |
 | `git` | Git sync | Sync/export YAML | git/* |
 | `terraform` | Terraform | Preview + write | terraform/* |
 
@@ -761,6 +789,14 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 | Activity / audit log | **Real** | Yes (Ops → Activity) | `GET /v1/{ns}/audit`; login / publish / secrets / promote |
 | OTLP on API | **Real** | — | Lifespan setup/shutdown; HTTP + execute spans; OTLP/HTTP export |
 | Eval judge quality | **Real** | Yes (Ops → Evaluations) | Keyword, latency, tool, LLM judges; publish auto-triggers |
+| **Production readiness score** | **Real** | Yes (Ops → Readiness) | Security / reliability / quality / cost / governance / performance / deployment; blockers + `safe_to_deploy` / `watch` / `not_ready`. Missing evidence lowers the score. Not a publish hard-gate by default. |
+| Agent CI/CD (PR → security/golden/cost → deploy) | Partial | Publish gates only | Readiness sits on top of gates; full pipeline not built |
+| Continuous production validation / drift | Partial | Drift on re-check | In-memory last score; no scheduled prod re-validation |
+| Trajectory evaluation | Partial | Eval `tool_accuracy` | Final-answer judges exist; full expected vs actual tool path not scored |
+| Security simulation (attack the agent) | Missing | — | Next after readiness |
+| Agent firewall (contextual risk) | Partial | Policy + governor + sandbox | Runtime pieces exist; not a productized risk engine |
+| Agent inventory / shadow agents | Partial | Discovery + readiness inventory | Published agents on *this* platform only |
+| Decision intelligence (precedent graph) | Partial | Context graph | Graph exists; not wired into readiness/refund decisions |
 | Multi-namespace switcher | **Real** | Yes (topbar) | Persist NS; ensure + list APIs |
 | Multi-agent collaboration UI | **Real** | Yes (Build → Multi-agent) | Role wiring + timeline + diagnosis |
 | Resource actions | **Real** | Yes | New / Clone / Edit / Unpublish (not hard-delete) |
@@ -778,14 +814,21 @@ Use this when you read online about “agent platforms” and ask: *do we alread
 
 ## 13. What you can add next
 
-Ordered by remaining leverage:
+Do **not** add another model provider, CRD, generic CRUD, basic RAG, chat playground, or observability dashboard. Compete on the decision layer.
 
-1. Hard resource delete (optional) — skipped by product choice.
-2. Real LLM eval gates in CI (judges exist; CI still mostly mock).
-3. Billing / org invites / usage quotas for full multi-tenant SaaS packaging.
-4. Federation / AMTP production trust + DR runbooks.
+**Build next (in order):**
 
-**Recently shipped:** live multi-agent SSE streaming; richer policy “why denied” UX; edge telemetry charts; broader audit producers + retention; one-command SaaS deploy (`scripts/saas-up.sh`); SCIM Identity Studio UI; richer HITL + OIDC Playwright e2e; production auth/ops hardening; Redis multi-instance governor; Studio Activity / audit log; deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
+1. **Agent CI/CD** — PR → security / injection / golden / tool / cost / latency / policy tests → readiness → approval → deploy. The gate is: *can this version safely replace production?*
+2. **Continuous production validation** — not merely monitoring. Re-score after model-route or tool changes; recommend rollback when readiness degrades.
+3. **Trajectory evaluation** — expected tool sequence vs actual (a correct final answer can still be a dangerous path).
+4. **Security simulation** — generate prompt-injection / privilege / exfil scenarios and attack the agent before prod.
+5. **Agent firewall** — contextual risk on every tool call (amount, identity, confidence → block / HITL).
+6. **Enterprise agent inventory** — including shadow agents that were not created here.
+7. **Decision intelligence** — context-graph precedents as evidence (“17 similar refunds, 12 approved”).
+
+**Moat:** production trajectories → eval data → failure patterns → better readiness checks. Feature-for-feature with AgentCore / Foundry / LangSmith is a losing game.
+
+**Recently shipped:** Production Readiness Engine + Studio scorecard; live multi-agent SSE streaming; richer policy “why denied” UX; edge telemetry charts; broader audit producers + retention; one-command SaaS deploy (`scripts/saas-up.sh`); SCIM Identity Studio UI; richer HITL + OIDC Playwright e2e; production auth/ops hardening; Redis multi-instance governor; Studio Activity / audit log; deeper multi-agent Studio; end-to-end policy/guardrail enforcement; regions/edge; HITL inbox; OIDC; OTLP.
 
 ---
 
@@ -826,6 +869,7 @@ If you want to *own* this mentally, read in this order:
 | Regions / edge | `/regions`, `/edge/nodes`, `/edge/register`, `/regions/{name}/primary|failover` |
 | HITL inbox | `/workflows/inbox`, `/workflows/runs/{id}`, approve/resume |
 | Auth / SCIM | `POST /auth/login`, `/scim/v2/Users` |
+| Readiness | `GET .../readiness`, `GET .../readiness/{name}`, `POST .../readiness/{name}/check` |
 | Bundles | `GET /bundles/{environment}` |
 | Tune | `POST .../model-routes/{name}/tune` |
 
@@ -847,6 +891,7 @@ If you want to *own* this mentally, read in this order:
 | `tests/test_oidc.py` | OIDC JWKS validation + SSO callback |
 | `tests/test_studio_namespaces.py` | Namespace APIs + unpublish |
 | `tests/test_evaluation.py` | Eval judges + publish gates |
+| `tests/test_readiness.py` | Production readiness engine + HTTP Production Check |
 | `console/e2e/studio.spec.ts` | Playwright Studio login + nav |
 
 CI: `.github/workflows/ci.yml` — pytest, **Postgres service job**, console build, **Playwright e2e**, Docker build.

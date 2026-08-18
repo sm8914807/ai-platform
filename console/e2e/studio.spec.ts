@@ -22,6 +22,10 @@ test.describe("Platform Studio", () => {
     await page.getByTestId("nav-collaboration").click();
     await expect(page.getByRole("heading", { name: /multi-agent/i })).toBeVisible();
 
+    await page.getByTestId("nav-readiness").click();
+    await expect(page.getByTestId("readiness-view")).toBeVisible();
+    await expect(page.getByRole("heading", { name: /production readiness/i })).toBeVisible();
+
     await page.getByTestId("nav-metrics").click();
     await expect(page.getByRole("heading", { name: /metrics/i })).toBeVisible();
 

@@ -1951,6 +1951,118 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         st = state(request)
         return {"runs": st.eval_runner.recent_runs(limit=min(max(limit, 1), 100))}
 
+    async def _readiness_context(st: AppState, namespace: str, env: str):
+        ns_id = await st.registry.ensure_namespace(namespace, env)
+        published = await st.registry.list_published(ns_id)
+        bundle = _bundle_index(published)
+        versions = {v.name: v.version for v in published if v.kind == "Agent" and v.name}
+        hashes = {v.name: v.bundle_hash for v in published if v.kind == "Agent" and v.name}
+        org_id = namespace.split("/", 1)[0]
+        audit_refs: dict[str, bool] = {}
+        try:
+            audit = await st.registry.list_audit(org_id, limit=200, action="resource.published")
+            for e in audit:
+                ref = str(e.resource_ref or "")
+                if ref.startswith("Agent/") or ref.startswith("agents/"):
+                    audit_refs[f"agents/{ref.split('/', 1)[-1]}"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        metrics_by_route: dict[str, dict] = {}
+        try:
+            summary = await st.metrics_collector.summarize_namespace(ns_id, window=500)
+            for route in summary.get("routes") or []:
+                name = str(route.get("routeName") or "")
+                if name:
+                    metrics_by_route[name] = {"overview": route}
+        except Exception:  # noqa: BLE001
+            pass
+        # recent_runs is newest-first; engine treats the last matching run as latest.
+        eval_runs = list(reversed(st.eval_runner.recent_runs(100)))
+        return {
+            "ns_id": ns_id,
+            "bundle": bundle,
+            "versions": versions,
+            "hashes": hashes,
+            "audit_refs": audit_refs,
+            "metrics_by_route": metrics_by_route,
+            "eval_runs": eval_runs,
+        }
+
+    @app.get("/v1/{namespace:path}/readiness")
+    async def list_readiness(
+        namespace: str, request: Request, environment: str | None = None
+    ):
+        """Inventory: production-readiness decision for every published agent."""
+        st = state(request)
+        env = environment or settings.default_env
+        ctx = await _readiness_context(st, namespace, env)
+        reports = st.readiness.assess_inventory(
+            ctx["bundle"],
+            versions=ctx["versions"],
+            eval_runs=ctx["eval_runs"],
+            metrics_by_route=ctx["metrics_by_route"],
+            hashes=ctx["hashes"],
+            has_publish_audit=ctx["audit_refs"],
+            auth_required=st.auth_required,
+            dev_login_enabled=st.sso_service.allow_dev_login,
+        )
+        not_ready = sum(1 for r in reports if r.decision == "not_ready")
+        return {
+            "namespace": namespace,
+            "count": len(reports),
+            "notReady": not_ready,
+            "agents": [r.model_dump(mode="json", by_alias=True) for r in reports],
+        }
+
+    @app.get("/v1/{namespace:path}/readiness/{name}")
+    async def get_readiness(
+        namespace: str, name: str, request: Request, environment: str | None = None
+    ):
+        """Production Check for one published agent."""
+        st = state(request)
+        env = environment or settings.default_env
+        ctx = await _readiness_context(st, namespace, env)
+        if f"Agent:{name}" not in ctx["bundle"]:
+            raise HTTPException(404, detail=f"Published agent not found: {name}")
+        spec = ctx["bundle"][f"Agent:{name}"].get("spec") or {}
+        model_ref = str(spec.get("modelRef") or spec.get("model_ref") or "")
+        route = model_ref.split("/", 1)[-1] if "/" in model_ref else model_ref
+        report = st.readiness.assess(
+            agent_ref=f"agents/{name}",
+            bundle=ctx["bundle"],
+            version=ctx["versions"].get(name),
+            eval_runs=ctx["eval_runs"],
+            route_metrics=ctx["metrics_by_route"].get(route),
+            published=True,
+            bundle_hash=ctx["hashes"].get(name),
+            has_publish_audit=ctx["audit_refs"].get(f"agents/{name}", False),
+            auth_required=st.auth_required,
+            dev_login_enabled=st.sso_service.allow_dev_login,
+        )
+        return report.model_dump(mode="json", by_alias=True)
+
+    @app.post("/v1/{namespace:path}/readiness/{name}/check")
+    async def run_readiness_check(
+        namespace: str, name: str, request: Request, environment: str | None = None
+    ):
+        """Explicit Production Check (same as GET, records audit)."""
+        st = state(request)
+        report = await get_readiness(namespace, name, request, environment)
+        await _record_audit(
+            st,
+            org_id=namespace.split("/", 1)[0],
+            action="readiness.checked",
+            actor_id=_auth_principal(request, st),
+            resource_ref=f"agents/{name}",
+            payload={
+                "overall": report.get("overall"),
+                "decision": report.get("decision"),
+                "blockers": report.get("blockers"),
+            },
+            ip=request.client.host if request.client else None,
+        )
+        return report
+
     @app.post("/v1/{namespace:path}/promote")
     async def promote_environment(namespace: str, body: PromoteBody, request: Request):
         st = state(request)

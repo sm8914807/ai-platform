@@ -24,6 +24,7 @@ import {
   type PlatformMessage,
   type PolicyDenial,
   type RegionInfo,
+  type ReadinessReport,
   type Resource,
   type SecretMeta,
   type Trace,
@@ -66,6 +67,7 @@ type View =
   | "marketplace"
   | "metrics"
   | "evaluations"
+  | "readiness"
   | "git"
   | "terraform"
   | "regions"
@@ -98,6 +100,7 @@ const NAV_GROUPS: { label: string; items: { id: View; label: string }[] }[] = [
   {
     label: "Ops",
     items: [
+      { id: "readiness", label: "Readiness" },
       { id: "activity", label: "Activity" },
       { id: "identity", label: "Identity (SCIM)" },
       { id: "metrics", label: "Metrics" },
@@ -369,6 +372,7 @@ export default function App() {
           {view === "marketplace" && <MarketplaceView ns={ns} onError={setError} />}
           {view === "metrics" && <MetricsView ns={ns} onError={setError} />}
           {view === "evaluations" && <EvaluationsView ns={ns} onError={setError} />}
+          {view === "readiness" && <ReadinessView ns={ns} onError={setError} />}
           {view === "regions" && <RegionsView ns={ns} onError={setError} />}
           {view === "git" && <GitSyncView ns={ns} user={user} onError={setError} />}
           {view === "terraform" && <TerraformView ns={ns} onError={setError} />}
@@ -693,13 +697,14 @@ function Overview({
   return (
     <section>
       <header className="page-header">
-        <h1>Control plane</h1>
+        <h1>Ship agents to production safely</h1>
         <p className="muted">
-          Configure CRDs, inspect decision memory, manage secrets, and federate AMTP agents
+          Production Check scores published agents on security, reliability, quality, cost, and
+          governance
           {health?.federationDomain ? (
             <>
               {" "}
-              on <span className="mono">{health.federationDomain}</span>
+              · <span className="mono">{health.federationDomain}</span>
             </>
           ) : null}
           .
@@ -715,9 +720,10 @@ function Overview({
       </div>
       <PlatformArchitecture />
       <div className="toolbar" style={{ marginTop: "1.25rem" }}>
-        <button className="primary" onClick={() => go("maps")}>
-          Open flow maps
+        <button className="primary" onClick={() => go("readiness")}>
+          Production Check
         </button>
+        <button onClick={() => go("maps")}>Open flow maps</button>
         <button onClick={() => go("workflows")}>Plan a workflow</button>
         <button onClick={() => go("editor")}>Resource editor</button>
       </div>
@@ -2829,6 +2835,216 @@ function EvaluationsView({ ns, onError }: { ns: string; onError: (e: string) => 
       </div>
     </section>
   );
+}
+
+const DIM_LABELS: Record<string, string> = {
+  security: "Security",
+  reliability: "Reliability",
+  quality: "Quality",
+  cost: "Cost",
+  performance: "Performance",
+  governance: "Governance",
+  deployment: "Deployment",
+};
+
+function ReadinessView({ ns, onError }: { ns: string; onError: (e: string) => void }) {
+  const [inventory, setInventory] = useState<{
+    count: number;
+    notReady: number;
+    agents: ReadinessReport[];
+  } | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [openDim, setOpenDim] = useState<string | null>("security");
+
+  const load = useCallback(() => {
+    api
+      .listReadiness(ns)
+      .then((r) => {
+        setInventory({ count: r.count, notReady: r.notReady, agents: r.agents });
+        setSelected((cur) => {
+          if (cur && r.agents.some((a) => a.agentRef === cur)) return cur;
+          const firstBad = r.agents.find((a) => a.decision === "not_ready");
+          return (firstBad ?? r.agents[0])?.agentRef ?? null;
+        });
+      })
+      .catch((e) => onError(String(e.message ?? e)));
+  }, [ns, onError]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const report = inventory?.agents.find((a) => a.agentRef === selected) ?? null;
+
+  async function productionCheck() {
+    if (!selected) return;
+    const name = selected.split("/")[1];
+    if (!name) return;
+    setBusy(true);
+    try {
+      const next = await api.checkReadiness(ns, name);
+      setInventory((prev) => {
+        if (!prev) return prev;
+        const agents = prev.agents.map((a) => (a.agentRef === next.agentRef ? next : a));
+        return {
+          ...prev,
+          agents,
+          notReady: agents.filter((a) => a.decision === "not_ready").length,
+        };
+      });
+    } catch (e) {
+      onError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section data-testid="readiness-view">
+      <header className="page-header">
+        <h1>Production readiness</h1>
+        <p className="muted">
+          Not traces. Not eval scores. A deploy decision: can this agent go to production?
+        </p>
+      </header>
+      {inventory && (
+        <p className="muted" style={{ marginTop: 0 }}>
+          {inventory.count} published agent{inventory.count === 1 ? "" : "s"}
+          {inventory.notReady > 0 ? (
+            <>
+              {" "}
+              · <span className="badge danger">{inventory.notReady} not ready</span>
+            </>
+          ) : inventory.count > 0 ? (
+            <>
+              {" "}
+              · <span className="badge ok">none blocked</span>
+            </>
+          ) : null}
+        </p>
+      )}
+      {!inventory || inventory.agents.length === 0 ? (
+        <div className="panel">
+          <p className="muted">
+            Publish an agent (and its model, prompt, policies, and eval suite) to run a Production
+            Check.
+          </p>
+        </div>
+      ) : (
+        <div className="readiness-layout">
+          <div className="panel list">
+            <div className="form-section-title">Inventory</div>
+            <ul className="plain-list">
+              {inventory.agents.map((a) => (
+                <li key={a.agentRef}>
+                  <button
+                    className={a.agentRef === selected ? "list-item active" : "list-item"}
+                    onClick={() => setSelected(a.agentRef)}
+                  >
+                    <div>
+                      <span className="mono">{a.agentRef.replace(/^agents\//, "")}</span>
+                      {a.version ? <span className="muted"> · v{a.version}</span> : null}
+                    </div>
+                    <div>
+                      <span className={`badge ${decisionBadge(a.decision)}`}>{a.overall}</span>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+          {report ? (
+            <div>
+              <div className="panel readiness-hero">
+                <div>
+                  <div className="muted" style={{ textTransform: "uppercase", letterSpacing: "0.08em", fontSize: "0.72rem" }}>
+                    {report.agentRef.replace(/^agents\//, "").replace(/-/g, " ")}
+                    {report.version ? ` · v${report.version}` : ""}
+                  </div>
+                  <div className={`readiness-score ${decisionBadge(report.decision)}`}>
+                    {report.overall}
+                    <span className="readiness-over"> / 100</span>
+                  </div>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div className={`readiness-decision ${report.decision}`}>{report.decisionLabel}</div>
+                  <div className="toolbar" style={{ marginTop: "0.75rem" }}>
+                    <button className="primary" disabled={busy} onClick={productionCheck}>
+                      {busy ? "Checking…" : "Production Check"}
+                    </button>
+                    <button onClick={load}>Refresh inventory</button>
+                  </div>
+                </div>
+              </div>
+              {report.drift?.degraded ? (
+                <div className="banner error" style={{ marginTop: "1rem" }}>
+                  Production readiness degraded {report.drift.previousOverall} → {report.overall}
+                  {typeof report.drift.delta === "number" ? ` (${report.drift.delta})` : ""}
+                </div>
+              ) : null}
+              <div className="panel" style={{ marginTop: "1rem" }}>
+                <div className="form-section-title">Dimensions</div>
+                {report.dimensions.map((d) => (
+                  <div key={d.name} className="dim-block">
+                    <button className="dim-row" onClick={() => setOpenDim(openDim === d.name ? null : d.name)}>
+                      <span>{DIM_LABELS[d.name] ?? d.name}</span>
+                      <span className={`dim-meter ${d.status}`}>
+                        <span style={{ width: `${Math.max(4, d.score)}%` }} />
+                      </span>
+                      <span className={`badge ${d.status === "pass" ? "ok" : d.status === "warn" ? "warn" : "danger"}`}>
+                        {d.score}
+                        {d.status === "pass" ? " ✓" : d.status === "warn" ? " ⚠" : ""}
+                      </span>
+                    </button>
+                    {openDim === d.name ? (
+                      <ul className="plain-list dim-checks">
+                        {d.checks.map((c) => (
+                          <li key={c.id}>
+                            <span className={`badge ${c.status === "pass" ? "ok" : c.status === "warn" ? "warn" : "danger"}`}>
+                              {c.status}
+                            </span>{" "}
+                            <strong>{c.title}</strong>
+                            <div className="muted">{c.detail}</div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              {report.blockers.length > 0 ? (
+                <div className="panel" style={{ marginTop: "1rem", borderColor: "var(--danger)" }}>
+                  <div className="form-section-title">Blockers</div>
+                  <ul>
+                    {report.blockers.map((b) => (
+                      <li key={b}>{b}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {report.recommendations.length > 0 ? (
+                <div className="panel" style={{ marginTop: "1rem" }}>
+                  <div className="form-section-title">Remediation</div>
+                  <ul>
+                    {report.recommendations.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function decisionBadge(decision: ReadinessReport["decision"]): string {
+  if (decision === "safe_to_deploy") return "ok";
+  if (decision === "watch") return "warn";
+  return "danger";
 }
 
 function GitSyncView({

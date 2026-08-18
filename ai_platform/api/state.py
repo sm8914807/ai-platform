@@ -20,6 +20,7 @@ from ai_platform.observability.metrics import MetricsCollector
 from ai_platform.policy.engine import PolicyEngine
 from ai_platform.promotion.service import PromotionService
 from ai_platform.publish.service import PublishService
+from ai_platform.readiness.engine import ProductionReadinessEngine
 from ai_platform.region.service import RegionService
 from ai_platform.registry.store import RegistryStore
 from ai_platform.secrets.manager import SecretsManager
@@ -141,6 +142,7 @@ class AppState:
         )
         self.eval_runner = EvaluationRunner(model_router=self.agent_engine.model_router)
         self.publish_service = PublishService(registry, self.policy_engine, self.eval_runner)
+        self.readiness = ProductionReadinessEngine()
         self.workflow_engine = WorkflowEngine(
             agent_engine=self.agent_engine,
             tool_host=self.tool_host,
